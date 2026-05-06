@@ -82,9 +82,14 @@ async def _run_stream(
                 metrics.audio_seconds_sent += chunk_ms / 1000.0
                 # Pace at 1× real-time so Munsit can keep up.
                 await asyncio.sleep(chunk_ms / 1000.0)
-        stream.flush()
-        # Wait briefly for any trailing finals before closing.
-        await asyncio.sleep(2.0)
+        # Don't call stream.flush() here. Munsit's streaming endpoint emits a
+        # quick first cumulative, then ~100-300 ms later sends a refined version
+        # (e.g. with corrected diacritics). flush() forces the plugin to emit
+        # FINAL immediately, after which the refinement looks like a brand-new
+        # utterance and you get a duplicate FINAL. Letting the idle timer
+        # finalize naturally (after `finalize_after_silence_ms`, default 700 ms)
+        # gives the server time to settle and produces a single clean FINAL.
+        await asyncio.sleep(2.5)
         await stream.aclose()
 
     async def event_logger() -> None:
