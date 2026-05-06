@@ -469,8 +469,19 @@ class SpeechStream(stt.SpeechStream):
         pcm = bytes(frame.data)
         self._ensure_usage_collector().push(frame.duration)
         if not self._first_chunk_sent:
+            # Build the WAV header from the actual frame metadata, not the constructor
+            # defaults. AgentSession-driven frames will match self._opts; file-based
+            # demos may have different sample rates (e.g. a 24kHz WAV) and the header
+            # must declare what's really on the wire or Munsit will mis-decode.
+            if frame.sample_rate != self._opts.sample_rate:
+                logger.info(
+                    "Munsit first frame sample_rate=%d differs from configured %d; "
+                    "using frame's rate in WAV header.",
+                    frame.sample_rate,
+                    self._opts.sample_rate,
+                )
             header = build_wav_header(
-                sample_rate=self._opts.sample_rate, num_channels=self._opts.num_channels
+                sample_rate=frame.sample_rate, num_channels=frame.num_channels
             )
             payload = header + pcm
             self._first_chunk_sent = True

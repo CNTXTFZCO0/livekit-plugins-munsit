@@ -43,16 +43,19 @@ class Metrics:
         self.audio_seconds_sent: float = 0.0
 
 
-async def stream_wav(path: Path, metrics: Metrics) -> None:
+async def stream_wav(path: Path, metrics: Metrics, model: str = "munsit") -> None:
     # Pass an explicit aiohttp session so this script works outside a LiveKit job context.
     async with aiohttp.ClientSession() as http_session:
-        await _run_stream(path, metrics, http_session)
+        await _run_stream(path, metrics, http_session, model)
 
 
 async def _run_stream(
-    path: Path, metrics: Metrics, http_session: aiohttp.ClientSession
+    path: Path,
+    metrics: Metrics,
+    http_session: aiohttp.ClientSession,
+    model: str = "munsit",
 ) -> None:
-    stt_inst = munsit.STT(http_session=http_session)  # picks up MUNSIT_API_KEY from env
+    stt_inst = munsit.STT(model=model, http_session=http_session)  # MUNSIT_API_KEY from env
     stream = stt_inst.stream()
     metrics.audio_started_at = time.monotonic()
 
@@ -145,14 +148,23 @@ def _print_metrics_summary(m: Metrics) -> None:
 
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: stt_file_demo.py <path-to-wav>", file=sys.stderr)
+        print(
+            "Usage: stt_file_demo.py <path-to-wav> [model]\n"
+            "  model: 'munsit' (default, Arabic) or 'munsit-en-ar' (Arabic+English)\n"
+            "         can also be set via MUNSIT_MODEL env var",
+            file=sys.stderr,
+        )
         sys.exit(2)
     path = Path(sys.argv[1])
     if not path.exists():
         print(f"file not found: {path}", file=sys.stderr)
         sys.exit(2)
+    import os
+
+    model = sys.argv[2] if len(sys.argv) >= 3 else os.environ.get("MUNSIT_MODEL", "munsit")
+    print(f"# using model: {model}", file=sys.stderr)
     metrics = Metrics()
-    asyncio.run(stream_wav(path, metrics))
+    asyncio.run(stream_wav(path, metrics, model=model))
 
 
 if __name__ == "__main__":
