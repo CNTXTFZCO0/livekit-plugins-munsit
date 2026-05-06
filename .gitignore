@@ -151,3 +151,6 @@ Thumbs.db
 *.wav
 *.mp3
 test_output/
+
+# Test fixtures we DO want tracked (must come after *.wav above).
+!tests/sample_arabic.wav
