@@ -1,5 +1,5 @@
-livekit-agents>=1.4.4
-livekit-plugins-munsit
+# Example-only dependencies. The plugin itself (livekit-plugins-munsit) and
+# its base dep (livekit-agents) are installed by `uv sync` from the repo root.
 livekit-plugins-silero
 livekit-plugins-openai
 livekit-plugins-cartesia
