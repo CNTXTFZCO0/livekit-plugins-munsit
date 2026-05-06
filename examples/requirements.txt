@@ -1,0 +1,6 @@
+livekit-agents>=1.4.4
+livekit-plugins-munsit
+livekit-plugins-silero
+livekit-plugins-openai
+livekit-plugins-cartesia
+python-dotenv>=1.0.1

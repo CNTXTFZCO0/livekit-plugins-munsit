@@ -1,0 +1,89 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "livekit-plugins-munsit"
+dynamic = ["version"]
+description = "LiveKit Agents plugin for Munsit speech-to-text (Arabic + Arabic/English code-switching). Successor to livekit-plugins-faseeh."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10.0"
+authors = [
+    { name = "Mohan Raj Palanisamy", email = "mohanraj.palanisamy@cntxt.tech" }
+]
+maintainers = [
+    { name = "Mohan Raj Palanisamy", email = "mohanraj.palanisamy@cntxt.tech" }
+]
+keywords = [
+    "voice",
+    "ai",
+    "realtime",
+    "audio",
+    "stt",
+    "speech-to-text",
+    "arabic",
+    "livekit",
+    "munsit",
+    "faseeh",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+    "livekit-agents[codecs]>=1.4.4",
+    "numpy>=1.26",
+    "aiohttp>=3.8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/CNTXTFZCO0/livekit-plugins-munsit"
+Documentation = "https://github.com/CNTXTFZCO0/livekit-plugins-munsit#readme"
+Repository = "https://github.com/CNTXTFZCO0/livekit-plugins-munsit"
+"Bug Tracker" = "https://github.com/CNTXTFZCO0/livekit-plugins-munsit/issues"
+"Munsit" = "https://munsit.com"
+
+[tool.hatch.version]
+path = "livekit/plugins/munsit/version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["livekit"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/livekit"]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.25.3",
+    "ruff",
+    "mypy",
+    "python-dotenv>=1.0.1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+known-first-party = ["livekit"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+addopts = ["--import-mode=importlib", "--ignore=examples"]
+markers = ["integration: tests that hit live external services"]
