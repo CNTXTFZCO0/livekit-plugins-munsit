@@ -12,6 +12,7 @@ Run with::
 from __future__ import annotations
 
 import logging
+import os
 
 from dotenv import load_dotenv
 
@@ -102,11 +103,18 @@ _tracker = TurnTracker()
 
 @server.rtc_session()
 async def entrypoint(ctx: agents.JobContext) -> None:
+    model = os.environ.get("MUNSIT_MODEL", "munsit")
+    print(f"# using model: {model}")
     session = AgentSession(
-        stt=munsit.STT(),
+        stt=munsit.STT(model=model),
         llm=openai.LLM(model="gpt-4o-mini"),
         tts=cartesia.TTS(),
-        vad=silero.VAD.load(),
+        # Tightened VAD thresholds. AEC residual from the agent's own TTS
+        # leaks small amounts of audio back through the mic; on `munsit-en-ar`
+        # that residual reliably hallucinates a fixed phrase ("الـ AI") and
+        # triggers a feedback loop. Requiring louder + longer speech bursts
+        # before STT submission breaks the loop without losing real input.
+        vad=silero.VAD.load(activation_threshold=0.6, min_speech_duration=0.3),
         # Use Silero VAD for interruption detection. LiveKit's hosted
         # adaptive detector at agent-gateway.livekit.cloud needs LiveKit
         # Cloud auth and isn't necessary for a Munsit-based agent demo.
