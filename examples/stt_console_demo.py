@@ -42,6 +42,11 @@ async def entrypoint(ctx: JobContext) -> None:
     session = AgentSession(
         stt=munsit.STT(),
         vad=silero.VAD.load(),
+        # Skip LiveKit's hosted "adaptive" interruption detector
+        # (wss://agent-gateway.livekit.cloud/v1/bargein) and use Silero VAD
+        # directly — avoids 401 noise when LIVEKIT_* creds aren't set up
+        # for the inference gateway.
+        turn_handling={"interruption": {"mode": "vad"}},
     )
 
     @session.on("user_input_transcribed")

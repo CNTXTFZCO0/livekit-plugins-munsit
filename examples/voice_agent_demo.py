@@ -99,6 +99,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         llm=openai.LLM(model="gpt-4o-mini"),
         tts=cartesia.TTS(),
         vad=silero.VAD.load(),
+        # Use Silero VAD for interruption detection. LiveKit's hosted
+        # adaptive detector at agent-gateway.livekit.cloud needs LiveKit
+        # Cloud auth and isn't necessary for a Munsit-based agent demo.
+        turn_handling={"interruption": {"mode": "vad"}},
     )
 
     @session.on("metrics_collected")
