@@ -121,10 +121,16 @@ def _print_event(ev: SpeechEvent, m: Metrics) -> None:
         m.interim_count += 1
         print(f'[+{rel_ms}ms] INTERIM_TRANSCRIPT   "{text}"')
     elif ev.type == SpeechEventType.FINAL_TRANSCRIPT:
-        text = ev.alternatives[0].text if ev.alternatives else ""
+        sd = ev.alternatives[0] if ev.alternatives else None
+        text = sd.text if sd else ""
         m.final_at = time.monotonic()
         m.final_text = text
         print(f'[+{rel_ms}ms] FINAL_TRANSCRIPT     "{text}"')
+        # Surface word timestamps when batch mode returns them.
+        if sd and sd.words:
+            print("           word timings:")
+            for w in sd.words:
+                print(f"             {float(w.start_time):5.2f}s → {float(w.end_time):5.2f}s  {w!s}")
     elif ev.type == SpeechEventType.END_OF_SPEECH:
         print(f"[+{rel_ms}ms] END_OF_SPEECH")
         _print_metrics_summary(m)

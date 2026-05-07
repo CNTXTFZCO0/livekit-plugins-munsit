@@ -43,6 +43,7 @@ from .log import logger
 from .models import MunsitModels
 
 DEFAULT_BASE_URL = "wss://api.munsit.com/api/v1/websocket/speech-to-text"
+DEFAULT_BATCH_BASE_URL = "https://api.munsit.com/api/v1/audio/transcribe"
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_FINALIZE_AFTER_SILENCE_MS = 700
 DEFAULT_VAD_SILENCE_MS = 1500
@@ -55,12 +56,116 @@ _VALID_MODELS: tuple[str, ...] = ("munsit", "munsit-en-ar")
 
 AuthMethod = Literal["header", "bearer", "query"]
 EndpointingMode = Literal["server_diff", "client_vad"]
+Mode = Literal["batch", "streaming"]
+
+
+def _build_batch_url_and_headers(opts: _STTOptions) -> tuple[str, dict[str, str]]:
+    url = opts.batch_base_url
+    headers: dict[str, str] = {}
+    if opts.auth_method == "header":
+        headers["x-api-key"] = opts.api_key
+    elif opts.auth_method == "bearer":
+        headers["Authorization"] = f"Bearer {opts.api_key}"
+    else:  # "query"
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}{urlencode({'token': opts.api_key})}"
+    return url, headers
+
+
+async def _post_batch_audio(
+    *,
+    session: aiohttp.ClientSession,
+    opts: _STTOptions,
+    conn_options: APIConnectOptions,
+    wav_bytes: bytes,
+) -> dict:
+    """Send a multipart POST to Munsit's batch transcribe endpoint.
+
+    Shared by ``SpeechStream._submit_batch`` (per-utterance batching while
+    streaming) and ``STT._recognize_impl`` (synchronous full-buffer recognition).
+    """
+    url, headers = _build_batch_url_and_headers(opts)
+    form = aiohttp.FormData()
+    form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
+    form.add_field("model", str(opts.model))
+    try:
+        async with session.post(
+            url,
+            data=form,
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=conn_options.timeout * 6),
+        ) as resp:
+            body = await resp.text()
+            if resp.status in (401, 403):
+                raise APIStatusError(
+                    message=f"Munsit auth rejected: {body[:200]}",
+                    status_code=resp.status,
+                    request_id=None,
+                    body=body,
+                )
+            if resp.status >= 400:
+                raise APIStatusError(
+                    message=f"Munsit batch HTTP {resp.status}: {body[:200]}",
+                    status_code=resp.status,
+                    request_id=None,
+                    body=body,
+                )
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError as e:
+                raise APIConnectionError(
+                    f"Munsit batch returned non-JSON body: {body[:200]}"
+                ) from e
+            # Munsit's batch shape: {"statusCode": 200, "data": {...}, "message": "Success"}
+            data = parsed.get("data") if isinstance(parsed, dict) else None
+            if not isinstance(data, dict):
+                raise APIConnectionError(
+                    f"Munsit batch response missing 'data': {body[:200]}"
+                )
+            return data
+    except asyncio.TimeoutError as e:
+        raise APITimeoutError() from e
+    except aiohttp.ClientError as e:
+        raise APIConnectionError(f"Munsit batch connection error: {e}") from e
+
+
+def _batch_response_to_speech_data(
+    opts: _STTOptions,
+    text: str,
+    duration: float,
+    timestamps: list[dict[str, object]],
+) -> stt.SpeechData:
+    from livekit.agents.voice.io import TimedString
+
+    words: list[TimedString] = []
+    for ts in timestamps:
+        word = ts.get("word")
+        start = ts.get("start")
+        end = ts.get("end")
+        if (
+            isinstance(word, str)
+            and isinstance(start, (int, float))
+            and isinstance(end, (int, float))
+        ):
+            words.append(
+                TimedString(text=word, start_time=float(start), end_time=float(end))
+            )
+    return stt.SpeechData(
+        language=LanguageCode(opts.language or "ar"),
+        start_time=0.0,
+        end_time=float(duration),
+        confidence=1.0,
+        text=text.strip(),
+        words=words,
+    )
 
 
 @dataclass
 class _STTOptions:
     api_key: str
     base_url: str
+    batch_base_url: str
+    mode: Mode
     model: MunsitModels | str
     auth_method: AuthMethod
     sample_rate: int
@@ -77,9 +182,11 @@ class STT(stt.STT):
     def __init__(
         self,
         *,
+        mode: Mode = "batch",
         model: MunsitModels | str = "munsit",
         api_key: NotGivenOr[str] = NOT_GIVEN,
         base_url: NotGivenOr[str] = NOT_GIVEN,
+        batch_base_url: NotGivenOr[str] = NOT_GIVEN,
         auth_method: AuthMethod = "header",
         sample_rate: int = DEFAULT_SAMPLE_RATE,
         num_channels: int = 1,
@@ -95,32 +202,42 @@ class STT(stt.STT):
         """Create a new instance of Munsit STT.
 
         Args:
+            mode: ``"batch"`` (default) buffers audio per utterance and POSTs the WAV to
+                ``/api/v1/audio/transcribe``; the consumer's VAD signals end-of-speech via
+                ``flush()``. Higher accuracy and word timestamps, but the FINAL doesn't fire
+                until the user stops speaking. ``"streaming"`` keeps a long-lived WebSocket
+                open and emits ``INTERIM_TRANSCRIPT`` events as cumulatives arrive — lower
+                latency at the cost of accuracy and no word-level timing.
             model: ASR model. ``"munsit"`` (default, Arabic) or ``"munsit-en-ar"`` (code-switching).
             api_key: Munsit API key. Falls back to the ``MUNSIT_API_KEY`` env var.
-            base_url: Override the WebSocket URL (e.g. for staging or self-hosted Munsit).
+            base_url: Override the streaming WebSocket URL (used only in ``mode="streaming"``).
+            batch_base_url: Override the batch HTTP URL (used only in ``mode="batch"``).
             auth_method: How to send the API key. ``"header"`` (``x-api-key``), ``"bearer"``
                 (``Authorization: Bearer ...``), or ``"query"`` (``?token=...``).
             sample_rate: Audio sample rate in Hz; used to synthesize the first-chunk WAV header.
             num_channels: Number of audio channels.
             interim_results: Emit ``INTERIM_TRANSCRIPT`` events as cumulative updates arrive.
+                Only meaningful in ``mode="streaming"``; batch mode never emits interims.
             endpointing: ``"server_diff"`` (default) keeps a single WS open and finalizes after
                 ``finalize_after_silence_ms`` of server silence. ``"client_vad"`` opens/closes the
-                WS per utterance using a local energy filter.
+                WS per utterance using a local energy filter. Only consulted in ``mode="streaming"``.
             finalize_after_silence_ms: Idle threshold for ``server_diff`` finalization (>= 100).
             energy_filter: ``AudioEnergyFilter`` instance or ``True`` to use defaults; only
-                consulted in ``"client_vad"`` mode. (Wired up in a later task.)
+                consulted in ``"client_vad"`` mode.
             vad_silence_ms: Silence duration that triggers utterance end in ``"client_vad"``
                 (>= 100).
             language: Label attached to emitted ``SpeechData.language``. Defaults to
                 ``"ar"`` if unset.
             http_session: Custom aiohttp session. Falls back to the LiveKit per-job shared session.
             extra_query_params: Forward-compat for new Munsit query params without an SDK update.
+                Currently only forwarded on the streaming WS URL.
         """
         super().__init__(
             capabilities=stt.STTCapabilities(
                 streaming=True,
-                interim_results=interim_results,
-                aligned_transcript=False,
+                interim_results=(mode == "streaming" and interim_results),
+                # Batch mode returns word timestamps; streaming does not.
+                aligned_transcript=("word" if mode == "batch" else False),
             )
         )
 
@@ -129,6 +246,9 @@ class STT(stt.STT):
             raise ValueError(
                 "Munsit API key is required, either as argument or via MUNSIT_API_KEY env var"
             )
+
+        if mode not in ("batch", "streaming"):
+            raise ValueError(f"mode must be 'batch' or 'streaming'; got {mode!r}")
 
         if str(model) not in _VALID_MODELS:
             raise ValueError(
@@ -155,6 +275,8 @@ class STT(stt.STT):
         self._opts = _STTOptions(
             api_key=munsit_api_key,
             base_url=base_url if is_given(base_url) else DEFAULT_BASE_URL,
+            batch_base_url=batch_base_url if is_given(batch_base_url) else DEFAULT_BATCH_BASE_URL,
+            mode=mode,
             model=model,
             auth_method=auth_method,
             sample_rate=sample_rate,
@@ -256,10 +378,47 @@ class STT(stt.STT):
         self._streams.add(speech_stream)
         return speech_stream
 
-    async def _recognize_impl(  # type: ignore[override]
-        self, *args: object, **kwargs: object
-    ) -> None:
-        raise NotImplementedError("Munsit only supports streaming recognition")
+    async def _recognize_impl(
+        self,
+        buffer: utils.AudioBuffer,
+        *,
+        language: NotGivenOr[str] = NOT_GIVEN,
+        conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
+    ) -> stt.SpeechEvent:
+        """Synchronous batch transcription via Munsit's HTTP endpoint.
+
+        Combines the AudioBuffer's frames into a single WAV blob and POSTs to
+        ``batch_base_url``. Returns a single FINAL_TRANSCRIPT SpeechEvent with
+        per-word timestamps populated. Works regardless of the configured
+        ``mode`` — synchronous recognition always uses HTTP.
+        """
+        combined = rtc.combine_audio_frames(buffer)
+        wav_bytes = (
+            build_wav_header(
+                sample_rate=combined.sample_rate, num_channels=combined.num_channels
+            )
+            + bytes(combined.data)
+        )
+
+        opts = replace(self._opts)
+        if is_given(language):
+            opts.language = language
+
+        data = await _post_batch_audio(
+            session=self._ensure_session(),
+            opts=opts,
+            conn_options=conn_options,
+            wav_bytes=wav_bytes,
+        )
+
+        text = data.get("transcription", "") or ""
+        duration = data.get("duration") or 0.0
+        timestamps = data.get("timestamps") or []
+        return stt.SpeechEvent(
+            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+            request_id=str(data.get("transcriptionId") or utils.shortuuid()),
+            alternatives=[_batch_response_to_speech_data(opts, text, duration, timestamps)],
+        )
 
 
 class SpeechStream(stt.SpeechStream):
@@ -289,6 +448,10 @@ class SpeechStream(stt.SpeechStream):
         self._usage_collector: PeriodicCollector[float] | None = None
         self._energy_filter = energy_filter
         self._vad_state_active: bool = False
+        # Batch-mode state:
+        self._batch_buffer: bytearray | None = None
+        self._batch_sample_rate: int = opts.sample_rate
+        self._batch_num_channels: int = opts.num_channels
 
     def _ensure_usage_collector(self) -> PeriodicCollector[float]:
         if self._usage_collector is None:
@@ -323,6 +486,9 @@ class SpeechStream(stt.SpeechStream):
         return url, headers
 
     async def _run(self) -> None:
+        if self._opts.mode == "batch":
+            await self._run_batch()
+            return
         if self._opts.endpointing == "client_vad":
             await self._run_client_vad()
             return
@@ -413,6 +579,87 @@ class SpeechStream(stt.SpeechStream):
             raise APITimeoutError() from e
         except aiohttp.ClientError as e:
             raise APIConnectionError(f"Munsit connection error: {e}") from e
+
+    async def _run_batch(self) -> None:
+        """Batch mode: buffer audio per utterance, POST WAV on flush, emit FINAL with word timestamps.
+
+        The consumer (typically AgentSession with VAD) signals end-of-speech via
+        ``stream.flush()`` (a ``_FlushSentinel`` on the input channel). On flush:
+
+          1. Build a WAV blob from accumulated PCM
+          2. POST to ``batch_base_url`` as multipart/form-data
+          3. Parse the JSON response and emit FINAL_TRANSCRIPT with per-word timings
+          4. Reset for the next utterance
+
+        The buffer is also flushed on input-channel close (consumer called
+        ``end_input()``) so a final utterance without an explicit flush still
+        produces a transcript.
+        """
+        async for data in self._input_ch:
+            if isinstance(data, rtc.AudioFrame):
+                self._append_to_batch_buffer(data)
+            elif isinstance(data, self._FlushSentinel):
+                if self._batch_buffer is not None and len(self._batch_buffer) > 0:
+                    await self._submit_batch()
+        # Input channel exhausted; submit any remaining buffered audio.
+        if self._batch_buffer is not None and len(self._batch_buffer) > 0:
+            await self._submit_batch()
+
+    def _append_to_batch_buffer(self, frame: rtc.AudioFrame) -> None:
+        if self._batch_buffer is None:
+            # First frame of a new utterance.
+            self._batch_buffer = bytearray()
+            self._batch_sample_rate = frame.sample_rate
+            self._batch_num_channels = frame.num_channels
+            self._request_id = utils.shortuuid()
+            self._event_ch.send_nowait(
+                stt.SpeechEvent(
+                    type=stt.SpeechEventType.START_OF_SPEECH, request_id=self._request_id
+                )
+            )
+        self._batch_buffer.extend(bytes(frame.data))
+        self._ensure_usage_collector().push(frame.duration)
+
+    async def _submit_batch(self) -> None:
+        """Build a WAV from the buffered PCM, POST to Munsit, emit FINAL events."""
+        assert self._batch_buffer is not None
+        wav_bytes = (
+            build_wav_header(
+                sample_rate=self._batch_sample_rate, num_channels=self._batch_num_channels
+            )
+            + bytes(self._batch_buffer)
+        )
+
+        try:
+            response_data = await _post_batch_audio(
+                session=self._session,
+                opts=self._opts,
+                conn_options=self._conn_options,
+                wav_bytes=wav_bytes,
+            )
+        except Exception:
+            # Reset buffer regardless of error so next utterance starts fresh.
+            self._batch_buffer = None
+            raise
+
+        text = response_data.get("transcription", "") or ""
+        duration = response_data.get("duration") or 0.0
+        timestamps = response_data.get("timestamps") or []
+        speech_data = _batch_response_to_speech_data(self._opts, text, duration, timestamps)
+
+        self._event_ch.send_nowait(
+            stt.SpeechEvent(
+                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+                request_id=self._request_id,
+                alternatives=[speech_data],
+            )
+        )
+        self._event_ch.send_nowait(
+            stt.SpeechEvent(
+                type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id
+            )
+        )
+        self._batch_buffer = None
 
     async def _run_client_vad(self) -> None:
         # Lazy default if energy_filter wasn't passed but mode is client_vad

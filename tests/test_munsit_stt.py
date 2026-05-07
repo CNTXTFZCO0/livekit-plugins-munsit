@@ -132,8 +132,20 @@ class TestSTTConstructor:
         with pytest.raises(ValueError, match="vad_silence_ms"):
             STT(api_key="x", vad_silence_ms=50)
 
-    def test_capabilities(self):
+    def test_default_mode_is_batch(self):
         stt = STT(api_key="x")
+        assert stt._opts.mode == "batch"
+
+    def test_capabilities_batch_default(self):
+        stt = STT(api_key="x")
+        assert stt.capabilities.streaming is True
+        # batch mode never emits interims regardless of the flag
+        assert stt.capabilities.interim_results is False
+        # batch returns word timestamps from the HTTP response
+        assert stt.capabilities.aligned_transcript == "word"
+
+    def test_capabilities_streaming(self):
+        stt = STT(api_key="x", mode="streaming")
         assert stt.capabilities.streaming is True
         assert stt.capabilities.interim_results is True
         assert stt.capabilities.aligned_transcript is False
@@ -143,9 +155,13 @@ class TestSTTConstructor:
         stt.update_options(model="munsit-en-ar")
         assert stt.model == "munsit-en-ar"
 
-    def test_capabilities_with_interim_disabled(self):
-        stt = STT(api_key="x", interim_results=False)
+    def test_capabilities_with_interim_disabled_in_streaming(self):
+        stt = STT(api_key="x", mode="streaming", interim_results=False)
         assert stt.capabilities.interim_results is False
+
+    def test_invalid_mode_raises(self):
+        with pytest.raises(ValueError, match="mode"):
+            STT(api_key="x", mode="not-a-mode")  # type: ignore[arg-type]
 
     def test_update_options_invalid_finalize_threshold(self):
         stt = STT(api_key="x")
@@ -202,7 +218,7 @@ def _silence_frame(duration_ms: int = 100, sample_rate: int = 16000) -> rtc.Audi
 class TestSpeechStreamHappyPath:
     async def test_first_chunk_includes_wav_header(self, fake_munsit, http_session):
         fake_munsit.script([(0.05, "transcription", "test")])
-        stt_inst = STT(api_key="x", base_url=fake_munsit.url, http_session=http_session)
+        stt_inst = STT(mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session)
         stream = stt_inst.stream()
         try:
             stream.push_frame(_silence_frame())
@@ -222,7 +238,7 @@ class TestSpeechStreamHappyPath:
 
     async def test_subsequent_chunks_no_wav_header(self, fake_munsit, http_session):
         fake_munsit.script([(0.5, "transcription", "x")])
-        stt_inst = STT(api_key="x", base_url=fake_munsit.url, http_session=http_session)
+        stt_inst = STT(mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session)
         stream = stt_inst.stream()
         try:
             for _ in range(3):
@@ -245,6 +261,7 @@ class TestSpeechStreamHappyPath:
             ]
         )
         stt_inst = STT(
+            mode="streaming",
             api_key="x",
             base_url=fake_munsit.url,
             http_session=http_session,
@@ -282,7 +299,7 @@ class TestServerErrors:
         from livekit.agents import APIConnectOptions, APIStatusError
 
         fake_munsit.script([(0.05, "transcription_error", "auth quota exceeded")])
-        stt_inst = STT(api_key="x", base_url=fake_munsit.url, http_session=http_session)
+        stt_inst = STT(mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session)
         # max_retry=0 so the APIStatusError propagates directly without being wrapped
         # in APIConnectionError after exhausted retries.
         stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
@@ -309,6 +326,7 @@ class TestServerDiffFinalization:
             ]
         )
         stt_inst = STT(
+            mode="streaming",
             api_key="x",
             base_url=fake_munsit.url,
             http_session=http_session,
@@ -353,6 +371,7 @@ class TestServerDiffFinalization:
             ]
         )
         stt_inst = STT(
+            mode="streaming",
             api_key="x",
             base_url=fake_munsit.url,
             http_session=http_session,
@@ -406,6 +425,7 @@ class TestDrainOnClose:
         # before this arrives.
         fake_munsit.script([(1.5, "transcription", "متأخر")])
         stt_inst = STT(
+            mode="streaming",
             api_key="x",
             base_url=fake_munsit.url,
             http_session=http_session,
@@ -458,6 +478,7 @@ class TestFlushSentinel:
 
         fake_munsit.script([(0.0, "transcription", "نص")])
         stt_inst = STT(
+            mode="streaming",
             api_key="x",
             base_url=fake_munsit.url,
             finalize_after_silence_ms=10000,
@@ -511,7 +532,7 @@ class TestAuthMethods:
     async def _connect_and_close(self, fake_munsit, http_session, **kwargs) -> None:
         from livekit.agents import APIConnectOptions
 
-        stt_inst = STT(base_url=fake_munsit.url, http_session=http_session, **kwargs)
+        stt_inst = STT(mode="streaming", base_url=fake_munsit.url, http_session=http_session, **kwargs)
         stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
 
         async def _drain(s: object) -> None:
@@ -577,6 +598,7 @@ class TestReconnect:
         # Force the fake server to close the WS after receiving 1 audio_chunk per connection.
         fake_munsit.state.close_after_messages = 1
         stt_inst = STT(
+            mode="streaming",
             api_key="x",
             base_url=fake_munsit.url,
             finalize_after_silence_ms=10000,
@@ -620,6 +642,7 @@ class TestReconnect:
 class TestUpdateOptionsReconnect:
     async def test_update_model_triggers_reconnect(self, fake_munsit, http_session):
         stt_inst = STT(
+            mode="streaming",
             api_key="x",
             base_url=fake_munsit.url,
             finalize_after_silence_ms=10000,
@@ -667,6 +690,7 @@ class TestRecognitionUsage:
     async def test_emits_recognition_usage(self, fake_munsit, http_session):
         fake_munsit.script([(0.0, "transcription", "x")])
         stt_inst = STT(
+            mode="streaming",
             api_key="x",
             base_url=fake_munsit.url,
             finalize_after_silence_ms=10000,
@@ -723,6 +747,7 @@ def _loud_frame(duration_ms: int = 100, sample_rate: int = 16000) -> rtc.AudioFr
 class TestClientVadMode:
     async def test_silence_does_not_open_ws(self, fake_munsit, http_session):
         stt_inst = STT(
+            mode="streaming",
             api_key="x",
             base_url=fake_munsit.url,
             endpointing="client_vad",
@@ -756,6 +781,7 @@ class TestClientVadMode:
     async def test_speech_then_silence_finalizes(self, fake_munsit, http_session):
         fake_munsit.script([(0.05, "transcription", "أهلا")])
         stt_inst = STT(
+            mode="streaming",
             api_key="x",
             base_url=fake_munsit.url,
             endpointing="client_vad",
@@ -799,6 +825,227 @@ class TestClientVadMode:
 
 
 # ---------------------------------------------------------------------------
+# Batch (HTTP) mode tests — exercise the /api/v1/audio/transcribe path.
+# ---------------------------------------------------------------------------
+class TestBatchMode:
+    """Batch mode buffers audio per utterance and POSTs to the HTTP endpoint
+    on flush. The fake server's _batch_handler returns a canned response with
+    word-level timestamps; tests verify the plugin parses them correctly."""
+
+    async def test_emits_final_with_word_timestamps(self, fake_munsit, http_session):
+        stt_inst = STT(
+            mode="batch",
+            api_key="x",
+            batch_base_url=fake_munsit.batch_url,
+            http_session=http_session,
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+
+        events: list = []
+        q: asyncio.Queue = asyncio.Queue()
+
+        async def collector(s: object) -> None:
+            try:
+                async for ev in s:  # type: ignore[attr-defined]
+                    await q.put(ev)
+            except Exception:
+                pass
+
+        col = asyncio.create_task(collector(stream))
+        try:
+            for _ in range(5):
+                stream.push_frame(_silence_frame(duration_ms=100))
+                await asyncio.sleep(0.01)
+            stream.end_input()
+            for _ in range(60):
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=0.2)
+                    events.append(ev)
+                    if ev.type == SpeechEventType.END_OF_SPEECH:
+                        break
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            col.cancel()
+            await stream.aclose()
+
+        types = [e.type for e in events]
+        assert SpeechEventType.START_OF_SPEECH in types
+        assert SpeechEventType.FINAL_TRANSCRIPT in types
+        assert SpeechEventType.END_OF_SPEECH in types
+
+        finals = [e for e in events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
+        assert len(finals) == 1
+        sd = finals[0].alternatives[0]
+        assert sd.text == "أبي أحول درهم لفرحان"
+        # Word timestamps from the fake response should populate SpeechData.words.
+        # TimedString is a str subclass, so equality with a plain str works.
+        assert len(sd.words) == 4
+        assert sd.words[0] == "أبي"
+        assert sd.words[0].start_time == 0.08
+        assert sd.words[0].end_time == 0.2
+        assert sd.words[3] == "لفرحان"
+
+    async def test_multipart_upload_shape(self, fake_munsit, http_session):
+        stt_inst = STT(
+            mode="batch",
+            api_key="my-test-key",
+            batch_base_url=fake_munsit.batch_url,
+            http_session=http_session,
+            model="munsit-en-ar",
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+        try:
+            for _ in range(3):
+                stream.push_frame(_silence_frame(duration_ms=100))
+                await asyncio.sleep(0.01)
+            stream.end_input()
+            await asyncio.sleep(1.0)  # let the POST complete
+        finally:
+            await stream.aclose()
+
+        assert fake_munsit.state.batch_received_count == 1
+        assert fake_munsit.state.batch_received_models == ["munsit-en-ar"]
+        # Audio should have been uploaded (header + 3 × 100ms × 16kHz × 2 bytes = 44 + 9600).
+        assert fake_munsit.state.batch_received_audio_sizes[0] >= 44 + (16000 // 10 * 2 * 3)
+        assert fake_munsit.state.batch_received_headers.get("x-api-key") == "my-test-key"
+
+    async def test_bearer_auth(self, fake_munsit, http_session):
+        stt_inst = STT(
+            mode="batch",
+            api_key="bearer-key",
+            batch_base_url=fake_munsit.batch_url,
+            http_session=http_session,
+            auth_method="bearer",
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+        try:
+            stream.push_frame(_silence_frame(duration_ms=100))
+            await asyncio.sleep(0.05)
+            stream.end_input()
+            await asyncio.sleep(1.0)
+        finally:
+            await stream.aclose()
+
+        assert (
+            fake_munsit.state.batch_received_headers.get("Authorization")
+            == "Bearer bearer-key"
+        )
+        assert "x-api-key" not in fake_munsit.state.batch_received_headers
+
+    async def test_query_auth(self, fake_munsit, http_session):
+        stt_inst = STT(
+            mode="batch",
+            api_key="query-key",
+            batch_base_url=fake_munsit.batch_url,
+            http_session=http_session,
+            auth_method="query",
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+        try:
+            stream.push_frame(_silence_frame(duration_ms=100))
+            await asyncio.sleep(0.05)
+            stream.end_input()
+            await asyncio.sleep(1.0)
+        finally:
+            await stream.aclose()
+
+        assert fake_munsit.state.batch_received_query.get("token") == "query-key"
+        assert "x-api-key" not in fake_munsit.state.batch_received_headers
+
+    async def test_server_error_raises_status_error(self, fake_munsit, http_session):
+        from livekit.agents import APIStatusError
+
+        fake_munsit.state.batch_response_status = 500
+        fake_munsit.state.batch_response_body = {"message": "internal error"}
+        stt_inst = STT(
+            mode="batch",
+            api_key="x",
+            batch_base_url=fake_munsit.batch_url,
+            http_session=http_session,
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+
+        with pytest.raises(APIStatusError) as exc_info:
+            try:
+                stream.push_frame(_silence_frame(duration_ms=100))
+                await asyncio.sleep(0.05)
+                stream.end_input()
+                async for _ in stream:
+                    pass
+            finally:
+                await stream.aclose()
+        assert exc_info.value.status_code == 500
+
+    async def test_recognize_sync_batch(self, fake_munsit, http_session):
+        """STT.recognize() should call the HTTP batch endpoint synchronously."""
+        stt_inst = STT(
+            mode="batch",
+            api_key="x",
+            batch_base_url=fake_munsit.batch_url,
+            http_session=http_session,
+        )
+        # Build a buffer of a few silent frames.
+        frames = [_silence_frame(duration_ms=100) for _ in range(5)]
+        event = await stt_inst.recognize(frames, conn_options=APIConnectOptions(max_retry=0))
+
+        assert event.type == SpeechEventType.FINAL_TRANSCRIPT
+        sd = event.alternatives[0]
+        assert sd.text == "أبي أحول درهم لفرحان"
+        assert len(sd.words) == 4
+
+    async def test_multiple_utterances_per_stream(self, fake_munsit, http_session):
+        """A single stream can be reused for multiple utterances; each flush submits a batch."""
+        stt_inst = STT(
+            mode="batch",
+            api_key="x",
+            batch_base_url=fake_munsit.batch_url,
+            http_session=http_session,
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+        events: list = []
+        q: asyncio.Queue = asyncio.Queue()
+
+        async def collector(s: object) -> None:
+            try:
+                async for ev in s:  # type: ignore[attr-defined]
+                    await q.put(ev)
+            except Exception:
+                pass
+
+        col = asyncio.create_task(collector(stream))
+        try:
+            # First utterance
+            for _ in range(3):
+                stream.push_frame(_silence_frame(duration_ms=100))
+                await asyncio.sleep(0.01)
+            stream.flush()
+            await asyncio.sleep(0.5)
+            # Second utterance
+            for _ in range(3):
+                stream.push_frame(_silence_frame(duration_ms=100))
+                await asyncio.sleep(0.01)
+            stream.end_input()
+            for _ in range(60):
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=0.2)
+                    events.append(ev)
+                except asyncio.TimeoutError:
+                    if (
+                        len([e for e in events if e.type == SpeechEventType.END_OF_SPEECH])
+                        >= 2
+                    ):
+                        break
+        finally:
+            col.cancel()
+            await stream.aclose()
+
+        finals = [e for e in events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
+        assert len(finals) == 2
+        assert fake_munsit.state.batch_received_count == 2
+
+
+# ---------------------------------------------------------------------------
 # Integration tests — hit the real Munsit API
 # ---------------------------------------------------------------------------
 # sample_arabic.wav is a synthetic 440 Hz tone (2 s, 16 kHz, mono 16-bit).
@@ -814,7 +1061,7 @@ class TestMunsitIntegration:
         wav_path = pathlib.Path(__file__).parent / "sample_arabic.wav"
         assert wav_path.exists(), "sample_arabic.wav missing — run Task 19 Step 2"
 
-        stt_inst = STT(http_session=http_session)  # real key from env
+        stt_inst = STT(mode="streaming", http_session=http_session)  # real key from env
         stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
         events: list = []
         q: asyncio.Queue = asyncio.Queue()
@@ -859,3 +1106,31 @@ class TestMunsitIntegration:
         types = [e.type for e in events]
         assert SpeechEventType.START_OF_SPEECH in types
         assert SpeechEventType.FINAL_TRANSCRIPT in types
+
+    @pytest.mark.skipif(
+        not os.environ.get("MUNSIT_API_KEY"),
+        reason="MUNSIT_API_KEY not set; skipping live integration test",
+    )
+    async def test_real_munsit_batch_transcribe(self, http_session):
+        """Hit the real /api/v1/audio/transcribe endpoint and verify word timestamps."""
+        wav_path = pathlib.Path(__file__).parent / "sample_arabic.wav"
+        assert wav_path.exists()
+
+        stt_inst = STT(mode="batch", http_session=http_session)
+        with wave.open(str(wav_path), "rb") as wf:
+            sr = wf.getframerate()
+            data = wf.readframes(wf.getnframes())
+            frame = rtc.AudioFrame(
+                data=data,
+                sample_rate=sr,
+                num_channels=1,
+                samples_per_channel=len(data) // 2,
+            )
+
+        event = await stt_inst.recognize(
+            [frame], conn_options=APIConnectOptions(max_retry=0)
+        )
+        assert event.type == SpeechEventType.FINAL_TRANSCRIPT
+        sd = event.alternatives[0]
+        assert sd.text, "expected non-empty transcript from real Munsit batch endpoint"
+        assert sd.end_time > 0
