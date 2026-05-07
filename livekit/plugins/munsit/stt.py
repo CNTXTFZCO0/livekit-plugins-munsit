@@ -47,6 +47,12 @@ DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_FINALIZE_AFTER_SILENCE_MS = 700
 DEFAULT_VAD_SILENCE_MS = 1500
 
+# Models the plugin accepts. We validate client-side because Munsit's API silently
+# accepts arbitrary `model` query values (including empty strings and typos) and
+# routes them to undefined fallback paths. To use a model not yet listed here,
+# pass an explicit override via `extra_query_params={"model": "..."}`.
+_VALID_MODELS: tuple[str, ...] = ("munsit", "munsit-en-ar")
+
 AuthMethod = Literal["header", "bearer", "query"]
 EndpointingMode = Literal["server_diff", "client_vad"]
 
@@ -124,6 +130,15 @@ class STT(stt.STT):
                 "Munsit API key is required, either as argument or via MUNSIT_API_KEY env var"
             )
 
+        if str(model) not in _VALID_MODELS:
+            raise ValueError(
+                f"model must be one of {_VALID_MODELS}; got {model!r}. "
+                "Munsit's streaming API silently accepts arbitrary model values and "
+                "routes them to undefined fallback paths, so this plugin validates "
+                "client-side to surface typos. To use a model not yet listed here, "
+                "pass an override via extra_query_params={'model': '...'}."
+            )
+
         if auth_method not in ("header", "bearer", "query"):
             raise ValueError(
                 f"auth_method must be 'header', 'bearer', or 'query'; got {auth_method!r}"
@@ -185,6 +200,11 @@ class STT(stt.STT):
     ) -> None:
         """Update STT options. Live streams reconnect to apply changes."""
         if model is not None:
+            if str(model) not in _VALID_MODELS:
+                raise ValueError(
+                    f"model must be one of {_VALID_MODELS}; got {model!r}. "
+                    "See STT.__init__ for details on the client-side whitelist."
+                )
             self._opts.model = model
         if language is not None:
             self._opts.language = language

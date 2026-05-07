@@ -103,6 +103,23 @@ class TestSTTConstructor:
         with pytest.raises(ValueError, match="auth_method"):
             STT(api_key="x", auth_method="wrong")  # type: ignore[arg-type]
 
+    def test_invalid_model_at_init_raises(self):
+        with pytest.raises(ValueError, match="model"):
+            STT(api_key="x", model="munsit-en-")  # typo
+
+    def test_empty_model_raises(self):
+        with pytest.raises(ValueError, match="model"):
+            STT(api_key="x", model="")
+
+    def test_garbage_model_raises(self):
+        with pytest.raises(ValueError, match="model"):
+            STT(api_key="x", model="definitely-not-a-real-model-xyz")
+
+    def test_update_options_invalid_model_raises(self):
+        stt = STT(api_key="x")
+        with pytest.raises(ValueError, match="model"):
+            stt.update_options(model="not-a-real-model")
+
     def test_invalid_sample_rate(self):
         with pytest.raises(ValueError, match="sample_rate"):
             STT(api_key="x", sample_rate=0)
