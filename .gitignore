@@ -154,3 +154,7 @@ test_output/
 
 # Test fixtures we DO want tracked (must come after *.wav above).
 !tests/sample_arabic.wav
+
+# Local scratch / API-poking artifacts
+chunk-*.json
+wav-to-postman-chunks.js
