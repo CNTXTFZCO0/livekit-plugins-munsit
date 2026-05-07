@@ -6,6 +6,10 @@ Run with:
     cp .env.example .env  # set MUNSIT_API_KEY at minimum
     uv run python stt_console_demo.py console
 
+To switch models, set MUNSIT_MODEL in your environment:
+
+    MUNSIT_MODEL=munsit-en-ar uv run python stt_console_demo.py console
+
 The script wires Munsit STT + Silero VAD into an AgentSession and
 subscribes to `user_input_transcribed` events.  Every partial and final
 transcript is printed to stdout so you can verify Arabic (or code-switched)
@@ -15,6 +19,7 @@ recognition without a full agent stack.
 from __future__ import annotations
 
 import logging
+import os
 
 from dotenv import load_dotenv
 
@@ -39,8 +44,10 @@ class _PassthroughAgent(Agent):
 
 @server.rtc_session()
 async def entrypoint(ctx: JobContext) -> None:
+    model = os.environ.get("MUNSIT_MODEL", "munsit")
+    print(f"# using model: {model}")
     session = AgentSession(
-        stt=munsit.STT(),
+        stt=munsit.STT(model=model),
         vad=silero.VAD.load(),
         # Skip LiveKit's hosted "adaptive" interruption detector
         # (wss://agent-gateway.livekit.cloud/v1/bargein) and use Silero VAD
