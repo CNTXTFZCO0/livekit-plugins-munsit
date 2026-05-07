@@ -387,6 +387,16 @@ class SpeechStream(stt.SpeechStream):
                         self._reconnect_event.clear()
                         # Surface as a clean connection error so the outer loop reconnects.
                         raise APIConnectionError("Munsit options changed, reconnecting")
+                    # If send completed (input channel drained by aclose), give the
+                    # server a final window to emit transcripts. Without this, fast
+                    # consumer-side close paths (push audio → short wait → aclose)
+                    # tear down the WS before slow first-response from Munsit, and
+                    # the consumer sees no FINAL_TRANSCRIPT at all.
+                    if (
+                        send_task in done
+                        and self._opts.endpointing == "server_diff"
+                    ):
+                        await self._drain_pending_transcripts()
                 finally:
                     await utils.aio.gracefully_cancel(*tasks)
                     self._ws = None
@@ -584,6 +594,58 @@ class SpeechStream(stt.SpeechStream):
                 continue
             if (time.monotonic() - self._last_msg_at) >= threshold:
                 self._emit_final(self._last_cumulative)
+
+    async def _drain_pending_transcripts(self) -> None:
+        """Wait for the server to emit a final transcript after audio stream closes.
+
+        Called when ``_send_audio_task`` exits cleanly (input channel drained by
+        ``aclose``). The recv and idle tasks are still running while this method
+        runs; we just give them a chance to receive and finalize incoming
+        transcripts before the outer ``finally`` block tears them down.
+
+        Without this, a consumer pattern like::
+
+            for chunk in audio_stream:
+                stt_stream.push_frame(chunk)
+            await asyncio.sleep(0.5)  # too short for a slow first response
+            await stt_stream.aclose()
+
+        could close the WS before Munsit emits even the first ``transcription``
+        event, leaving the consumer with no FINAL_TRANSCRIPT.
+
+        Phases:
+          1. If no cumulative has arrived yet, wait up to ``DRAIN_FIRST_MSG_S``
+             seconds for the first one.
+          2. Once a cumulative is held, wait for the idle task to finalize it
+             (``finalize_after_silence_ms`` of server silence) plus a small
+             padding for refinements.
+          3. If a cumulative is still pending after the settle window, force-emit
+             it as FINAL so the consumer sees something.
+        """
+        DRAIN_FIRST_MSG_S = 5.0
+        SETTLE_PADDING_MS = 500
+
+        if not self._last_cumulative:
+            deadline = time.monotonic() + DRAIN_FIRST_MSG_S
+            while time.monotonic() < deadline:
+                if self._last_cumulative:
+                    break
+                if self._ws is None or self._ws.closed:
+                    break
+                await asyncio.sleep(0.05)
+
+        settle_deadline = time.monotonic() + (
+            self._opts.finalize_after_silence_ms + SETTLE_PADDING_MS
+        ) / 1000.0
+        while time.monotonic() < settle_deadline:
+            if not self._last_cumulative or not self._speaking:
+                break
+            if self._ws is None or self._ws.closed:
+                break
+            await asyncio.sleep(0.05)
+
+        if self._last_cumulative and self._speaking:
+            self._emit_final(self._last_cumulative)
 
     def _emit_final(self, text: str) -> None:
         self._event_ch.send_nowait(

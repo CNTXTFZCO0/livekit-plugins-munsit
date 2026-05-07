@@ -385,6 +385,71 @@ class TestServerDiffFinalization:
         assert finals[1].alternatives[0].text == "أهلا كيف حالك"
 
 
+class TestDrainOnClose:
+    """The plugin must not lose FINAL_TRANSCRIPT events when the consumer
+    closes the stream before the server has time to emit its first response.
+
+    Reproduces the bug we observed in real Munsit testing where ~half of
+    runs returned no FINAL_TRANSCRIPT at all because the post-audio wait
+    in user code was shorter than Munsit's first-response latency.
+
+    Important: the consumer must call ``end_input()`` (not ``aclose()``)
+    after the last frame to give the drain a chance to run. ``aclose()``
+    cancels the main task immediately and kills any in-flight drain.
+    """
+
+    async def test_drain_waits_for_late_first_cumulative(
+        self, fake_munsit, http_session
+    ):
+        # Server emits its first (and only) transcription 1.5 seconds after
+        # the WS opens. A naive close-on-input-drain would tear down the WS
+        # before this arrives.
+        fake_munsit.script([(1.5, "transcription", "متأخر")])
+        stt_inst = STT(
+            api_key="x",
+            base_url=fake_munsit.url,
+            http_session=http_session,
+            finalize_after_silence_ms=300,
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+
+        events: list = []
+        q: asyncio.Queue = asyncio.Queue()
+
+        async def collector(s: object) -> None:
+            try:
+                async for ev in s:  # type: ignore[attr-defined]
+                    await q.put(ev)
+            except Exception:
+                pass
+
+        col = asyncio.create_task(collector(stream))
+        try:
+            # Push a brief audio (< 1 s of frames) and signal end of input
+            # immediately. The cumulative arrives during drain.
+            for _ in range(5):
+                stream.push_frame(_silence_frame(duration_ms=100))
+                await asyncio.sleep(0.02)
+            stream.end_input()  # closes input_ch without cancelling main task
+            # Drain in the plugin should now have time to receive "متأخر"
+            # and emit FINAL via the idle timer.
+            for _ in range(60):
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=0.2)
+                    events.append(ev)
+                    if ev.type == SpeechEventType.END_OF_SPEECH:
+                        break
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            col.cancel()
+            await stream.aclose()
+
+        finals = [e for e in events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
+        assert len(finals) >= 1, f"no FINAL emitted; events: {[e.type for e in events]}"
+        assert finals[0].alternatives[0].text == "متأخر"
+
+
 class TestFlushSentinel:
     async def test_flush_finalizes_immediately(self, fake_munsit, http_session):
         import time
