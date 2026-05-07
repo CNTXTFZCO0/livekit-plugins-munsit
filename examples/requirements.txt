@@ -1,5 +1,9 @@
-# Example-only dependencies. The plugin itself (livekit-plugins-munsit) and
-# its base dep (livekit-agents) are installed by `uv sync` from the repo root.
+# Dependencies for running the examples in this directory.
+#
+# Pulls livekit-plugins-munsit from PyPI; pin to a known-good version. The
+# plugin already declares livekit-agents as a transitive dep, so installing
+# this list alone is enough to run any example after `cp .env.example .env`.
+livekit-plugins-munsit>=0.3.0
 livekit-plugins-silero
 livekit-plugins-openai
 livekit-plugins-cartesia

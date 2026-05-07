@@ -10,28 +10,22 @@ Three runnable demos:
 
 ## Setup
 
-From the repo root:
+The simplest path — install everything from PyPI:
 
 ```bash
-# 1. Install the plugin (editable) + livekit-agents
-uv sync
-
-# 2. Install example-only deps (silero VAD, OpenAI LLM, Cartesia TTS, dotenv)
-uv pip install -r examples/requirements.txt
-
-# 3. Configure secrets
+pip install -r examples/requirements.txt
 cp examples/.env.example .env
 # edit .env: set MUNSIT_API_KEY (and LIVEKIT_*, OPENAI_API_KEY, CARTESIA_API_KEY for the agent demo)
 ```
 
-If you'd rather not clone the repo, install the plugin directly from GitHub:
+`examples/requirements.txt` pins `livekit-plugins-munsit>=0.3.0` plus the silero VAD, OpenAI LLM, Cartesia TTS, and dotenv deps the demos use. `livekit-agents` comes in transitively.
+
+If you cloned this repo and want to develop against the local plugin instead:
 
 ```bash
-pip install git+https://github.com/CNTXTFZCO0/livekit-plugins-munsit.git
-pip install -r examples/requirements.txt python-dotenv
+uv sync                                            # installs the plugin in editable mode + livekit-agents
+uv pip install -r examples/requirements.txt        # example-only deps
 ```
-
-(Once `livekit-plugins-munsit` is published to PyPI, you'll be able to `pip install livekit-plugins-munsit` instead.)
 
 ## Run
 
