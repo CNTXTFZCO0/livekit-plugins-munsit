@@ -16,14 +16,7 @@ import logging
 from dotenv import load_dotenv
 
 from livekit import agents
-from livekit.agents import Agent, AgentServer, AgentSession
-from livekit.agents.metrics import (
-    EOUMetrics,
-    LLMMetrics,
-    RealtimeModelMetrics,
-    STTMetrics,
-    TTSMetrics,
-)
+from livekit.agents import Agent, AgentServer, AgentSession, ChatMessage
 from livekit.plugins import cartesia, munsit, openai, silero
 
 load_dotenv()
@@ -45,26 +38,42 @@ class BilingualAssistant(Agent):
 
 
 class TurnTracker:
+    """Per-turn latency rollup using the conversation_item_added event.
+
+    LiveKit deprecated the ``metrics_collected`` event; per-turn metrics now
+    live on ``ChatMessage.metrics`` (a ``MetricsReport`` TypedDict). User
+    messages carry ``transcription_delay`` and ``end_of_turn_delay``;
+    assistant messages carry ``llm_node_ttft`` and ``tts_node_ttfb``.
+
+    We accumulate the user-side metrics when a user message lands, then
+    print the full rollup when the matching assistant message lands.
+    """
+
     def __init__(self) -> None:
         self._reset()
 
     def _reset(self) -> None:
+        self.transcription_delay_ms: float | None = None
         self.eou_ms: float | None = None
-        self.stt_audio_s: float | None = None
         self.llm_ttft_ms: float | None = None
         self.tts_ttfb_ms: float | None = None
 
-    def record(self, m: object) -> None:
-        if isinstance(m, EOUMetrics):
-            self.eou_ms = round(m.end_of_utterance_delay * 1000)
-        elif isinstance(m, STTMetrics):
-            self.stt_audio_s = round(m.audio_duration, 2)
-        elif isinstance(m, (RealtimeModelMetrics, LLMMetrics)):
-            ttft = getattr(m, "ttft", None)
-            if ttft is not None and ttft > 0:
-                self.llm_ttft_ms = round(ttft * 1000)
-        elif isinstance(m, TTSMetrics):
-            self.tts_ttfb_ms = round(m.ttfb * 1000)
+    def on_chat_message(self, msg: ChatMessage) -> None:
+        m = msg.metrics or {}
+        if msg.role == "user":
+            td = m.get("transcription_delay")
+            eou = m.get("end_of_turn_delay")
+            if td is not None:
+                self.transcription_delay_ms = round(td * 1000)
+            if eou is not None:
+                self.eou_ms = round(eou * 1000)
+        elif msg.role == "assistant":
+            llm_ttft = m.get("llm_node_ttft")
+            tts_ttfb = m.get("tts_node_ttfb")
+            if llm_ttft is not None and llm_ttft > 0:
+                self.llm_ttft_ms = round(llm_ttft * 1000)
+            if tts_ttfb is not None and tts_ttfb > 0:
+                self.tts_ttfb_ms = round(tts_ttfb * 1000)
             self._print_summary()
 
     def _print_summary(self) -> None:
@@ -73,19 +82,18 @@ class TurnTracker:
         if self.eou_ms is not None:
             parts.append(f"EOU {self.eou_ms} ms")
             total += self.eou_ms
+        if self.transcription_delay_ms is not None:
+            parts.append(f"STT {self.transcription_delay_ms} ms")
+            total += self.transcription_delay_ms
         if self.llm_ttft_ms is not None:
             parts.append(f"LLM {self.llm_ttft_ms} ms")
             total += self.llm_ttft_ms
         if self.tts_ttfb_ms is not None:
             parts.append(f"TTS {self.tts_ttfb_ms} ms")
             total += self.tts_ttfb_ms
-        audio_info = f" | stt_audio={self.stt_audio_s}s" if self.stt_audio_s is not None else ""
-        logger.info(
-            "Turn latency: %s = %.2fs%s",
-            " + ".join(parts),
-            total / 1000,
-            audio_info,
-        )
+        if not parts:
+            return  # nothing to print yet
+        logger.info("Turn latency: %s = %.2fs", " + ".join(parts), total / 1000)
         self._reset()
 
 
@@ -105,9 +113,10 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         turn_handling={"interruption": {"mode": "vad"}},
     )
 
-    @session.on("metrics_collected")
-    def _on_metrics(event):  # type: ignore[no-untyped-def]
-        _tracker.record(event.metrics)
+    @session.on("conversation_item_added")
+    def _on_item(event):  # type: ignore[no-untyped-def]
+        if isinstance(event.item, ChatMessage):
+            _tracker.on_chat_message(event.item)
 
     await session.start(room=ctx.room, agent=BilingualAssistant())
     await session.generate_reply(instructions="Greet the user warmly in Arabic.")
