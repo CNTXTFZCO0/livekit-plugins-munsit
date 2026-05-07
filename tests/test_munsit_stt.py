@@ -218,7 +218,9 @@ def _silence_frame(duration_ms: int = 100, sample_rate: int = 16000) -> rtc.Audi
 class TestSpeechStreamHappyPath:
     async def test_first_chunk_includes_wav_header(self, fake_munsit, http_session):
         fake_munsit.script([(0.05, "transcription", "test")])
-        stt_inst = STT(mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session)
+        stt_inst = STT(
+            mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session
+        )
         stream = stt_inst.stream()
         try:
             stream.push_frame(_silence_frame())
@@ -238,7 +240,9 @@ class TestSpeechStreamHappyPath:
 
     async def test_subsequent_chunks_no_wav_header(self, fake_munsit, http_session):
         fake_munsit.script([(0.5, "transcription", "x")])
-        stt_inst = STT(mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session)
+        stt_inst = STT(
+            mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session
+        )
         stream = stt_inst.stream()
         try:
             for _ in range(3):
@@ -299,7 +303,9 @@ class TestServerErrors:
         from livekit.agents import APIConnectOptions, APIStatusError
 
         fake_munsit.script([(0.05, "transcription_error", "auth quota exceeded")])
-        stt_inst = STT(mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session)
+        stt_inst = STT(
+            mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session
+        )
         # max_retry=0 so the APIStatusError propagates directly without being wrapped
         # in APIConnectionError after exhausted retries.
         stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
@@ -417,9 +423,7 @@ class TestDrainOnClose:
     cancels the main task immediately and kills any in-flight drain.
     """
 
-    async def test_drain_waits_for_late_first_cumulative(
-        self, fake_munsit, http_session
-    ):
+    async def test_drain_waits_for_late_first_cumulative(self, fake_munsit, http_session):
         # Server emits its first (and only) transcription 1.5 seconds after
         # the WS opens. A naive close-on-input-drain would tear down the WS
         # before this arrives.
@@ -532,7 +536,9 @@ class TestAuthMethods:
     async def _connect_and_close(self, fake_munsit, http_session, **kwargs) -> None:
         from livekit.agents import APIConnectOptions
 
-        stt_inst = STT(mode="streaming", base_url=fake_munsit.url, http_session=http_session, **kwargs)
+        stt_inst = STT(
+            mode="streaming", base_url=fake_munsit.url, http_session=http_session, **kwargs
+        )
         stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
 
         async def _drain(s: object) -> None:
@@ -630,7 +636,8 @@ class TestReconnect:
             await stream.aclose()
 
         riff_chunks = [
-            m for m in fake_munsit.state.received_messages
+            m
+            for m in fake_munsit.state.received_messages
             if m.get("event") == "audio_chunk"
             and m["data"]["audioBuffer"][0:4] == [ord("R"), ord("I"), ord("F"), ord("F")]
         ]
@@ -674,7 +681,8 @@ class TestUpdateOptionsReconnect:
         # Two WS connections should have happened: one with model=munsit, one with model=munsit-en-ar.
         # Each starts with a WAV header.
         riff_chunks = [
-            m for m in fake_munsit.state.received_messages
+            m
+            for m in fake_munsit.state.received_messages
             if m.get("event") == "audio_chunk"
             and m["data"]["audioBuffer"][0:4] == [ord("R"), ord("I"), ord("F"), ord("F")]
         ]
@@ -927,10 +935,7 @@ class TestBatchMode:
         finally:
             await stream.aclose()
 
-        assert (
-            fake_munsit.state.batch_received_headers.get("Authorization")
-            == "Bearer bearer-key"
-        )
+        assert fake_munsit.state.batch_received_headers.get("Authorization") == "Bearer bearer-key"
         assert "x-api-key" not in fake_munsit.state.batch_received_headers
 
     async def test_query_auth(self, fake_munsit, http_session):
@@ -1083,10 +1088,7 @@ class TestBatchMode:
                     ev = await asyncio.wait_for(q.get(), timeout=0.2)
                     events.append(ev)
                 except asyncio.TimeoutError:
-                    if (
-                        len([e for e in events if e.type == SpeechEventType.END_OF_SPEECH])
-                        >= 2
-                    ):
+                    if len([e for e in events if e.type == SpeechEventType.END_OF_SPEECH]) >= 2:
                         break
         finally:
             col.cancel()
@@ -1179,9 +1181,7 @@ class TestMunsitIntegration:
                 samples_per_channel=len(data) // 2,
             )
 
-        event = await stt_inst.recognize(
-            [frame], conn_options=APIConnectOptions(max_retry=0)
-        )
+        event = await stt_inst.recognize([frame], conn_options=APIConnectOptions(max_retry=0))
         assert event.type == SpeechEventType.FINAL_TRANSCRIPT
         sd = event.alternatives[0]
         assert sd.text, "expected non-empty transcript from real Munsit batch endpoint"

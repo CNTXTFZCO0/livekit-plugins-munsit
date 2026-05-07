@@ -119,9 +119,7 @@ async def _post_batch_audio(
             # Munsit's batch shape: {"statusCode": 200, "data": {...}, "message": "Success"}
             data = parsed.get("data") if isinstance(parsed, dict) else None
             if not isinstance(data, dict):
-                raise APIConnectionError(
-                    f"Munsit batch response missing 'data': {body[:200]}"
-                )
+                raise APIConnectionError(f"Munsit batch response missing 'data': {body[:200]}")
             return data
     except asyncio.TimeoutError as e:
         raise APITimeoutError() from e
@@ -147,9 +145,7 @@ def _batch_response_to_speech_data(
             and isinstance(start, (int, float))
             and isinstance(end, (int, float))
         ):
-            words.append(
-                TimedString(text=word, start_time=float(start), end_time=float(end))
-            )
+            words.append(TimedString(text=word, start_time=float(start), end_time=float(end)))
     return stt.SpeechData(
         language=LanguageCode(opts.language or "ar"),
         start_time=0.0,
@@ -393,12 +389,9 @@ class STT(stt.STT):
         ``mode`` — synchronous recognition always uses HTTP.
         """
         combined = rtc.combine_audio_frames(buffer)
-        wav_bytes = (
-            build_wav_header(
-                sample_rate=combined.sample_rate, num_channels=combined.num_channels
-            )
-            + bytes(combined.data)
-        )
+        wav_bytes = build_wav_header(
+            sample_rate=combined.sample_rate, num_channels=combined.num_channels
+        ) + bytes(combined.data)
 
         opts = replace(self._opts)
         if is_given(language):
@@ -512,9 +505,7 @@ class SpeechStream(stt.SpeechStream):
                     and time.monotonic() - self._last_connect_succeeded_at > 10.0
                 ):
                     backoff = self._initial_backoff
-                logger.warning(
-                    "Munsit connection error (%s), reconnecting in %.1fs", e, backoff
-                )
+                logger.warning("Munsit connection error (%s), reconnecting in %.1fs", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self._max_backoff)
 
@@ -558,10 +549,7 @@ class SpeechStream(stt.SpeechStream):
                     # consumer-side close paths (push audio → short wait → aclose)
                     # tear down the WS before slow first-response from Munsit, and
                     # the consumer sees no FINAL_TRANSCRIPT at all.
-                    if (
-                        send_task in done
-                        and self._opts.endpointing == "server_diff"
-                    ):
+                    if send_task in done and self._opts.endpointing == "server_diff":
                         await self._drain_pending_transcripts()
                 finally:
                     await utils.aio.gracefully_cancel(*tasks)
@@ -617,10 +605,7 @@ class SpeechStream(stt.SpeechStream):
                 ):
                     self._append_to_batch_buffer(data)
                 elif state == AudioEnergyFilter.State.END:
-                    if (
-                        self._batch_buffer is not None
-                        and len(self._batch_buffer) > 0
-                    ):
+                    if self._batch_buffer is not None and len(self._batch_buffer) > 0:
                         await self._submit_batch()
                 # State.SILENCE: discard (pre-speech or post-finalize silence).
             elif isinstance(data, self._FlushSentinel):
@@ -648,12 +633,9 @@ class SpeechStream(stt.SpeechStream):
     async def _submit_batch(self) -> None:
         """Build a WAV from the buffered PCM, POST to Munsit, emit FINAL events."""
         assert self._batch_buffer is not None
-        wav_bytes = (
-            build_wav_header(
-                sample_rate=self._batch_sample_rate, num_channels=self._batch_num_channels
-            )
-            + bytes(self._batch_buffer)
-        )
+        wav_bytes = build_wav_header(
+            sample_rate=self._batch_sample_rate, num_channels=self._batch_num_channels
+        ) + bytes(self._batch_buffer)
 
         try:
             response_data = await _post_batch_audio(
@@ -680,9 +662,7 @@ class SpeechStream(stt.SpeechStream):
             )
         )
         self._event_ch.send_nowait(
-            stt.SpeechEvent(
-                type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id
-            )
+            stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id)
         )
         self._batch_buffer = None
 
@@ -906,9 +886,9 @@ class SpeechStream(stt.SpeechStream):
                     break
                 await asyncio.sleep(0.05)
 
-        settle_deadline = time.monotonic() + (
-            self._opts.finalize_after_silence_ms + SETTLE_PADDING_MS
-        ) / 1000.0
+        settle_deadline = (
+            time.monotonic() + (self._opts.finalize_after_silence_ms + SETTLE_PADDING_MS) / 1000.0
+        )
         while time.monotonic() < settle_deadline:
             if not self._last_cumulative or not self._speaking:
                 break
@@ -928,9 +908,7 @@ class SpeechStream(stt.SpeechStream):
             )
         )
         self._event_ch.send_nowait(
-            stt.SpeechEvent(
-                type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id
-            )
+            stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id)
         )
         self._last_cumulative = ""
         self._speaking = False

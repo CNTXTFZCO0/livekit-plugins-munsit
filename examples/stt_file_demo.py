@@ -130,7 +130,9 @@ def _print_event(ev: SpeechEvent, m: Metrics) -> None:
         if sd and sd.words:
             print("           word timings:")
             for w in sd.words:
-                print(f"             {float(w.start_time):5.2f}s → {float(w.end_time):5.2f}s  {w!s}")
+                print(
+                    f"             {float(w.start_time):5.2f}s → {float(w.end_time):5.2f}s  {w!s}"
+                )
     elif ev.type == SpeechEventType.END_OF_SPEECH:
         print(f"[+{rel_ms}ms] END_OF_SPEECH")
         _print_metrics_summary(m)

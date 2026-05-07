@@ -1,5 +1,6 @@
 # Copyright 2026 LiveKit, Inc.
 """Local WebSocket server emulating Munsit's STT streaming endpoint for tests."""
+
 from __future__ import annotations
 
 import asyncio

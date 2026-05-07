@@ -37,8 +37,8 @@ def build_wav_header(
         + struct.pack("<I", riff_size)
         + b"WAVE"
         + b"fmt "
-        + struct.pack("<I", 16)            # fmt chunk size
-        + struct.pack("<H", 1)             # PCM format
+        + struct.pack("<I", 16)  # fmt chunk size
+        + struct.pack("<H", 1)  # PCM format
         + struct.pack("<H", num_channels)
         + struct.pack("<I", sample_rate)
         + struct.pack("<I", byte_rate)
