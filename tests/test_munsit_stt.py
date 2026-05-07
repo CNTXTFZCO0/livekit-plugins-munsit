@@ -994,6 +994,58 @@ class TestBatchMode:
         assert sd.text == "أبي أحول درهم لفرحان"
         assert len(sd.words) == 4
 
+    async def test_speech_then_silence_triggers_submit(self, fake_munsit, http_session):
+        """Mimics the AgentSession flow: VAD-detected speech, then silence
+        frames pushed by AgentSession after end-of-speech. Batch mode's
+        internal energy filter should detect the silence and submit
+        *without* needing an explicit flush."""
+        stt_inst = STT(
+            mode="batch",
+            api_key="x",
+            batch_base_url=fake_munsit.batch_url,
+            http_session=http_session,
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+
+        events: list = []
+        q: asyncio.Queue = asyncio.Queue()
+
+        async def collector(s: object) -> None:
+            try:
+                async for ev in s:  # type: ignore[attr-defined]
+                    await q.put(ev)
+            except Exception:
+                pass
+
+        col = asyncio.create_task(collector(stream))
+        try:
+            # Loud frames simulate user speech
+            for _ in range(5):
+                stream.push_frame(_loud_frame(duration_ms=100))
+                await asyncio.sleep(0.01)
+            # Silence frames simulate AgentSession's post-EOU silence push
+            for _ in range(10):
+                stream.push_frame(_silence_frame(duration_ms=100))
+                await asyncio.sleep(0.01)
+            # Note: NO flush, NO end_input — relies on internal VAD.
+            for _ in range(80):
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=0.2)
+                    events.append(ev)
+                    if ev.type == SpeechEventType.END_OF_SPEECH:
+                        break
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            col.cancel()
+            await stream.aclose()
+
+        finals = [e for e in events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
+        assert len(finals) >= 1, (
+            f"VAD-driven submit didn't fire; events: {[e.type for e in events]}"
+        )
+        assert fake_munsit.state.batch_received_count >= 1
+
     async def test_multiple_utterances_per_stream(self, fake_munsit, http_session):
         """A single stream can be reused for multiple utterances; each flush submits a batch."""
         stt_inst = STT(

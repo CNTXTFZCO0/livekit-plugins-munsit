@@ -581,23 +581,48 @@ class SpeechStream(stt.SpeechStream):
             raise APIConnectionError(f"Munsit connection error: {e}") from e
 
     async def _run_batch(self) -> None:
-        """Batch mode: buffer audio per utterance, POST WAV on flush, emit FINAL with word timestamps.
+        """Batch mode: buffer audio per utterance, POST WAV when speech ends.
 
-        The consumer (typically AgentSession with VAD) signals end-of-speech via
-        ``stream.flush()`` (a ``_FlushSentinel`` on the input channel). On flush:
+        Uses an internal energy-based VAD to drive utterance segmentation.
+        This is necessary because LiveKit's AgentSession does not call
+        ``stream.flush()`` on the STT — it instead pushes silence frames after
+        VAD detects end-of-speech and waits for the STT to emit a FINAL on
+        its own. Streaming-mode STTs respond via their idle timer; batch
+        STTs need to detect that silence themselves and submit.
 
-          1. Build a WAV blob from accumulated PCM
-          2. POST to ``batch_base_url`` as multipart/form-data
-          3. Parse the JSON response and emit FINAL_TRANSCRIPT with per-word timings
-          4. Reset for the next utterance
+        Triggers for submitting the buffer (in priority order):
+          1. AudioEnergyFilter transitions to ``State.END`` after at least one
+             non-silent frame was buffered. This is the normal AgentSession
+             flow — VAD-detected end-of-speech, AgentSession pushes silence,
+             our energy filter sees the silence and ends the utterance.
+          2. ``_FlushSentinel`` on the input channel (explicit flush from
+             a consumer that knows what it's doing).
+          3. Input-channel close (consumer called ``end_input()`` or the
+             session ended).
 
-        The buffer is also flushed on input-channel close (consumer called
-        ``end_input()``) so a final utterance without an explicit flush still
-        produces a transcript.
+        First-frame-non-silent gating: ``_append_to_batch_buffer`` only starts
+        a buffer when it sees a non-silent frame, so leading silence (before
+        the user starts speaking) doesn't fire a spurious START_OF_SPEECH.
         """
+        # 500 ms of trailing silence is short enough to keep EOU latency low
+        # but long enough to ride out brief mid-utterance pauses.
+        energy = AudioEnergyFilter(min_silence=0.5)
+
         async for data in self._input_ch:
             if isinstance(data, rtc.AudioFrame):
-                self._append_to_batch_buffer(data)
+                state = energy.update(data)
+                if state in (
+                    AudioEnergyFilter.State.START,
+                    AudioEnergyFilter.State.SPEAKING,
+                ):
+                    self._append_to_batch_buffer(data)
+                elif state == AudioEnergyFilter.State.END:
+                    if (
+                        self._batch_buffer is not None
+                        and len(self._batch_buffer) > 0
+                    ):
+                        await self._submit_batch()
+                # State.SILENCE: discard (pre-speech or post-finalize silence).
             elif isinstance(data, self._FlushSentinel):
                 if self._batch_buffer is not None and len(self._batch_buffer) > 0:
                     await self._submit_batch()
