@@ -4,11 +4,23 @@ See https://docs.munsit.com for the upstream API documentation.
 """
 
 from ._utils import AudioEnergyFilter
-from .models import MunsitModels
+from .models import MunsitModels, TTSModels
 from .stt import STT, SpeechStream
+from .tts import DEFAULT_VOICE_ID, TTS, Voice, VoiceSettings
 from .version import __version__
 
-__all__ = ["STT", "SpeechStream", "AudioEnergyFilter", "MunsitModels", "__version__"]
+__all__ = [
+    "STT",
+    "SpeechStream",
+    "TTS",
+    "Voice",
+    "VoiceSettings",
+    "DEFAULT_VOICE_ID",
+    "AudioEnergyFilter",
+    "MunsitModels",
+    "TTSModels",
+    "__version__",
+]
 
 
 from livekit.agents import Plugin
