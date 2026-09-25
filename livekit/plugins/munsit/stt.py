@@ -38,13 +38,15 @@ from livekit.agents import (
 )
 from livekit.agents.utils import is_given
 
-from ._utils import AudioEnergyFilter, PeriodicCollector, build_wav_header, pcm_to_audiobuffer
+from ._utils import AudioEnergyFilter, PeriodicCollector, build_wav_header
 from .log import logger
 from .models import MunsitModels
 
-DEFAULT_BASE_URL = "wss://api.munsit.com/api/v1/websocket/speech-to-text"
+DEFAULT_BASE_URL = "wss://api.munsit.com/api/v1/listen"
 DEFAULT_BATCH_BASE_URL = "https://api.munsit.com/api/v1/audio/transcribe"
 DEFAULT_SAMPLE_RATE = 16000
+DEFAULT_ENDPOINTING_MS = 800
+# Legacy defaults, kept for deprecation mapping:
 DEFAULT_FINALIZE_AFTER_SILENCE_MS = 700
 DEFAULT_VAD_SILENCE_MS = 1500
 
@@ -68,7 +70,8 @@ def _build_batch_url_and_headers(opts: _STTOptions) -> tuple[str, dict[str, str]
         headers["Authorization"] = f"Bearer {opts.api_key}"
     else:  # "query"
         sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}{urlencode({'token': opts.api_key})}"
+        # send both spellings: `api_key` (current gateway) and `token` (legacy backend)
+        url = f"{url}{sep}{urlencode({'api_key': opts.api_key, 'token': opts.api_key})}"
     return url, headers
 
 
@@ -88,6 +91,10 @@ async def _post_batch_audio(
     form = aiohttp.FormData()
     form.add_field("file", wav_bytes, filename="audio.wav", content_type="audio/wav")
     form.add_field("model", str(opts.model))
+    if opts.hotwords and str(opts.model) != "munsit-en-ar":
+        form.add_field("hotwords", ",".join(opts.hotwords))
+    if opts.return_confidence:
+        form.add_field("return_confidence", "true")
     try:
         async with session.post(
             url,
@@ -136,6 +143,7 @@ def _batch_response_to_speech_data(
     from livekit.agents.voice.io import TimedString
 
     words: list[TimedString] = []
+    confidences: list[float] = []
     for ts in timestamps:
         word = ts.get("word")
         start = ts.get("start")
@@ -146,11 +154,14 @@ def _batch_response_to_speech_data(
             and isinstance(end, (int, float))
         ):
             words.append(TimedString(text=word, start_time=float(start), end_time=float(end)))
+            conf = ts.get("confidence")
+            if isinstance(conf, (int, float)):
+                confidences.append(float(conf))
     return stt.SpeechData(
         language=LanguageCode(opts.language or "ar"),
         start_time=0.0,
         end_time=float(duration),
-        confidence=1.0,
+        confidence=(sum(confidences) / len(confidences)) if confidences else 1.0,
         text=text.strip(),
         words=words,
     )
@@ -167,19 +178,22 @@ class _STTOptions:
     sample_rate: int
     num_channels: int
     interim_results: bool
-    endpointing: EndpointingMode
-    finalize_after_silence_ms: int
-    vad_silence_ms: int
+    endpointing_ms: int
+    smart_turn: bool
+    hotwords: list[str] | None
+    correlation_id: str | None
+    return_confidence: bool
     language: str | None
     extra_query_params: dict[str, str] | None
+    on_enrichment: object | None = None   # callable(dict) for Sentiment/Gender events
 
 
 class STT(stt.STT):
     def __init__(
         self,
         *,
-        mode: Mode = "batch",
-        model: MunsitModels | str = "munsit",
+        mode: Mode = "streaming",
+        model: MunsitModels | str = "munsit-en-ar",
         api_key: NotGivenOr[str] = NOT_GIVEN,
         base_url: NotGivenOr[str] = NOT_GIVEN,
         batch_base_url: NotGivenOr[str] = NOT_GIVEN,
@@ -187,53 +201,98 @@ class STT(stt.STT):
         sample_rate: int = DEFAULT_SAMPLE_RATE,
         num_channels: int = 1,
         interim_results: bool = True,
-        endpointing: EndpointingMode = "server_diff",
-        finalize_after_silence_ms: int = DEFAULT_FINALIZE_AFTER_SILENCE_MS,
-        energy_filter: AudioEnergyFilter | bool = False,
-        vad_silence_ms: int = DEFAULT_VAD_SILENCE_MS,
+        endpointing_ms: int = DEFAULT_ENDPOINTING_MS,
+        smart_turn: bool = True,
+        hotwords: list[str] | None = None,
+        correlation_id: str | None = None,
+        return_confidence: bool = False,
         language: str | None = None,
         http_session: aiohttp.ClientSession | None = None,
         extra_query_params: dict[str, str] | None = None,
+        on_enrichment: object | None = None,
+        # ── deprecated (0.3.x legacy socket) — accepted, mapped, warned ──
+        endpointing: NotGivenOr[EndpointingMode] = NOT_GIVEN,
+        finalize_after_silence_ms: NotGivenOr[int] = NOT_GIVEN,
+        energy_filter: AudioEnergyFilter | bool = False,
+        vad_silence_ms: NotGivenOr[int] = NOT_GIVEN,
     ) -> None:
         """Create a new instance of Munsit STT.
 
         Args:
-            mode: ``"batch"`` (default) buffers audio per utterance and POSTs the WAV to
-                ``/api/v1/audio/transcribe``; the consumer's VAD signals end-of-speech via
-                ``flush()``. Higher accuracy and word timestamps, but the FINAL doesn't fire
-                until the user stops speaking. ``"streaming"`` keeps a long-lived WebSocket
-                open and emits ``INTERIM_TRANSCRIPT`` events as cumulatives arrive — lower
-                latency at the cost of accuracy and no word-level timing.
-            model: ASR model. ``"munsit"`` (default, Arabic) or ``"munsit-en-ar"`` (code-switching).
+            mode: ``"streaming"`` (default) keeps a live WebSocket to ``/api/v1/listen``:
+                interim results while speaking, server-side turn detection, word
+                timestamps and confidence on finals. ``"batch"`` buffers audio per
+                utterance and POSTs the WAV to ``/api/v1/audio/transcribe``.
+            model: ``"munsit-en-ar"`` (default — Arabic + English code-switch) or
+                ``"munsit"`` (pure Arabic, fastest). Applies to BOTH modes: batch sends
+                it as a form field; streaming sends it on the socket query, where the
+                server routes the session to the matching live engine.
             api_key: Munsit API key. Falls back to the ``MUNSIT_API_KEY`` env var.
-            base_url: Override the streaming WebSocket URL (used only in ``mode="streaming"``).
-            batch_base_url: Override the batch HTTP URL (used only in ``mode="batch"``).
-            auth_method: How to send the API key. ``"header"`` (``x-api-key``), ``"bearer"``
-                (``Authorization: Bearer ...``), or ``"query"`` (``?token=...``).
-            sample_rate: Audio sample rate in Hz; used to synthesize the first-chunk WAV header.
-            num_channels: Number of audio channels.
-            interim_results: Emit ``INTERIM_TRANSCRIPT`` events as cumulative updates arrive.
-                Only meaningful in ``mode="streaming"``; batch mode never emits interims.
-            endpointing: ``"server_diff"`` (default) keeps a single WS open and finalizes after
-                ``finalize_after_silence_ms`` of server silence. ``"client_vad"`` opens/closes the
-                WS per utterance using a local energy filter. Only consulted in ``mode="streaming"``.
-            finalize_after_silence_ms: Idle threshold for ``server_diff`` finalization (>= 100).
-            energy_filter: ``AudioEnergyFilter`` instance or ``True`` to use defaults; only
-                consulted in ``"client_vad"`` mode.
-            vad_silence_ms: Silence duration that triggers utterance end in ``"client_vad"``
-                (>= 100).
-            language: Label attached to emitted ``SpeechData.language``. Defaults to
-                ``"ar"`` if unset.
-            http_session: Custom aiohttp session. Falls back to the LiveKit per-job shared session.
-            extra_query_params: Forward-compat for new Munsit query params without an SDK update.
-                Currently only forwarded on the streaming WS URL.
+            base_url: Override the streaming WebSocket URL (``mode="streaming"``).
+            batch_base_url: Override the batch HTTP URL (``mode="batch"``).
+            auth_method: ``"header"`` (``x-api-key``), ``"bearer"`` (``Authorization``), or
+                ``"query"`` (sends ``api_key=`` — plus legacy ``token=`` on the batch URL).
+            sample_rate: Input sample rate hint. Streaming negotiates 8000 or 16000 with the
+                server and resamples anything else (LiveKit tracks are typically 48000).
+            num_channels: Number of audio channels (batch WAV header).
+            interim_results: Emit ``INTERIM_TRANSCRIPT`` events while a turn is in progress
+                (streaming mode).
+            endpointing_ms: Server-side silence window that ends a turn (100-5000, default
+                800). Retunable live via ``ListenStream.configure_endpointing``.
+            smart_turn: Gate end-of-turn on the server's semantic turn-completion model in
+                addition to silence (default on).
+            hotwords: Custom vocabulary — a list of rare terms/phrases to bias recognition
+                toward (up to 200 entries of up to 40 characters). Applies to streaming and
+                batch on the ``munsit`` model; ignored (with a warning) for
+                ``munsit-en-ar``, which has no biasing.
+            correlation_id: Session identifier echoed on every streaming event (<=128 chars).
+            return_confidence: Batch mode — request per-word confidence in timestamps.
+            language: Transcription language. ``"ar"`` (default) is the only streaming value.
+            http_session: Custom aiohttp session. Falls back to the LiveKit shared session.
+            extra_query_params: Forward-compat for new query params without an SDK update.
+            on_enrichment: Optional callable receiving raw ``Sentiment``/``Gender`` event
+                dicts from the streaming session (they have no LiveKit event equivalent).
+            endpointing: DEPRECATED (legacy socket). Ignored; server-side endpointing is
+                always used.
+            finalize_after_silence_ms: DEPRECATED. Mapped to ``endpointing_ms`` if that was
+                not set explicitly.
+            energy_filter: DEPRECATED for streaming (batch keeps an internal energy VAD).
+            vad_silence_ms: DEPRECATED. Ignored.
         """
+        import warnings
+
+        if is_given(endpointing):
+            warnings.warn(
+                "endpointing='server_diff'/'client_vad' is deprecated: /api/v1/listen does "
+                "server-side turn detection. Use endpointing_ms and smart_turn instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        if is_given(finalize_after_silence_ms):
+            warnings.warn(
+                "finalize_after_silence_ms is deprecated; use endpointing_ms.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if endpointing_ms == DEFAULT_ENDPOINTING_MS:
+                endpointing_ms = max(100, min(5000, int(finalize_after_silence_ms)))
+        if is_given(vad_silence_ms):
+            warnings.warn("vad_silence_ms is deprecated and ignored.", DeprecationWarning,
+                          stacklevel=2)
+        if energy_filter is not False:
+            warnings.warn(
+                "energy_filter is deprecated: batch mode uses an internal energy VAD and "
+                "streaming mode uses server-side turn detection.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
         super().__init__(
             capabilities=stt.STTCapabilities(
                 streaming=True,
                 interim_results=(mode == "streaming" and interim_results),
-                # Batch mode returns word timestamps; streaming does not.
-                aligned_transcript=("word" if mode == "batch" else False),
+                # Both modes return word timestamps now.
+                aligned_transcript="word",
             )
         )
 
@@ -249,10 +308,8 @@ class STT(stt.STT):
         if str(model) not in _VALID_MODELS:
             raise ValueError(
                 f"model must be one of {_VALID_MODELS}; got {model!r}. "
-                "Munsit's streaming API silently accepts arbitrary model values and "
-                "routes them to undefined fallback paths, so this plugin validates "
-                "client-side to surface typos. To use a model not yet listed here, "
-                "pass an override via extra_query_params={'model': '...'}."
+                "To use a model not yet listed here, pass an override via "
+                "extra_query_params={'model': '...'}."
             )
 
         if auth_method not in ("header", "bearer", "query"):
@@ -263,10 +320,29 @@ class STT(stt.STT):
             raise ValueError("sample_rate must be positive")
         if num_channels <= 0:
             raise ValueError("num_channels must be positive")
-        if finalize_after_silence_ms < 100:
-            raise ValueError("finalize_after_silence_ms must be >= 100")
-        if vad_silence_ms < 100:
-            raise ValueError("vad_silence_ms must be >= 100")
+        if not 100 <= endpointing_ms <= 5000:
+            raise ValueError("endpointing_ms must be within 100..5000")
+        if hotwords is not None:
+            if len(hotwords) > 200:
+                raise ValueError("hotwords supports at most 200 entries")
+            for w in hotwords:
+                if len(w) > 40:
+                    raise ValueError(f"hotword entries must be <= 40 characters; got {w!r}")
+                if "," in w:
+                    raise ValueError(f"hotword entries must not contain commas; got {w!r}")
+        if correlation_id is not None and len(correlation_id) > 128:
+            raise ValueError("correlation_id must be <= 128 characters")
+        if str(model) == "munsit-en-ar" and hotwords:
+            # Mirror faseeh's server-side behavior (it silently drops biasing for this
+            # model) instead of raising: with en-ar as the default model, a hard error
+            # would break every existing `STT(hotwords=[...])` call site.
+            warnings.warn(
+                "hotwords are not supported with model 'munsit-en-ar' and will be "
+                "ignored — recognition biasing exists only on the Arabic 'munsit' model",
+                UserWarning,
+                stacklevel=2,
+            )
+            hotwords = None
 
         self._opts = _STTOptions(
             api_key=munsit_api_key,
@@ -278,20 +354,23 @@ class STT(stt.STT):
             sample_rate=sample_rate,
             num_channels=num_channels,
             interim_results=interim_results,
-            endpointing=endpointing,
-            finalize_after_silence_ms=finalize_after_silence_ms,
-            vad_silence_ms=vad_silence_ms,
+            endpointing_ms=endpointing_ms,
+            smart_turn=smart_turn,
+            hotwords=list(hotwords) if hotwords else None,
+            correlation_id=correlation_id,
+            return_confidence=return_confidence,
             language=language,
             extra_query_params=extra_query_params,
+            on_enrichment=on_enrichment,
         )
         if isinstance(energy_filter, AudioEnergyFilter):
             self._energy_filter: AudioEnergyFilter | None = energy_filter
         elif energy_filter is True:
-            self._energy_filter = AudioEnergyFilter(min_silence=vad_silence_ms / 1000.0)
+            self._energy_filter = AudioEnergyFilter()
         else:
             self._energy_filter = None
         self._session = http_session
-        self._streams: weakref.WeakSet[SpeechStream] = weakref.WeakSet()
+        self._streams: weakref.WeakSet[stt.SpeechStream] = weakref.WeakSet()
 
     @property
     def model(self) -> str:
@@ -312,47 +391,38 @@ class STT(stt.STT):
         model: MunsitModels | str | None = None,
         language: str | None = None,
         interim_results: bool | None = None,
-        endpointing: EndpointingMode | None = None,
-        finalize_after_silence_ms: int | None = None,
-        vad_silence_ms: int | None = None,
+        endpointing_ms: int | None = None,
+        smart_turn: bool | None = None,
+        hotwords: list[str] | None = None,
     ) -> None:
         """Update STT options. Live streams reconnect to apply changes."""
         if model is not None:
             if str(model) not in _VALID_MODELS:
-                raise ValueError(
-                    f"model must be one of {_VALID_MODELS}; got {model!r}. "
-                    "See STT.__init__ for details on the client-side whitelist."
-                )
+                raise ValueError(f"model must be one of {_VALID_MODELS}; got {model!r}.")
             self._opts.model = model
         if language is not None:
             self._opts.language = language
         if interim_results is not None:
             self._opts.interim_results = interim_results
-        if endpointing is not None:
-            self._opts.endpointing = endpointing
-        if finalize_after_silence_ms is not None:
-            if finalize_after_silence_ms < 100:
-                raise ValueError("finalize_after_silence_ms must be >= 100")
-            self._opts.finalize_after_silence_ms = finalize_after_silence_ms
-        if vad_silence_ms is not None:
-            if vad_silence_ms < 100:
-                raise ValueError("vad_silence_ms must be >= 100")
-            self._opts.vad_silence_ms = vad_silence_ms
+        if endpointing_ms is not None:
+            if not 100 <= endpointing_ms <= 5000:
+                raise ValueError("endpointing_ms must be within 100..5000")
+            self._opts.endpointing_ms = endpointing_ms
+        if smart_turn is not None:
+            self._opts.smart_turn = smart_turn
+        if hotwords is not None:
+            self._opts.hotwords = list(hotwords)
         for stream in self._streams:
-            # Propagate changed options into the stream's own copy so the next
-            # WS connection (triggered by _reconnect_event) uses the new values.
-            if model is not None:
-                stream._opts.model = model
-            if language is not None:
-                stream._opts.language = language
-            if interim_results is not None:
-                stream._opts.interim_results = interim_results
-            if endpointing is not None:
-                stream._opts.endpointing = endpointing
-            if finalize_after_silence_ms is not None:
-                stream._opts.finalize_after_silence_ms = finalize_after_silence_ms
-            if vad_silence_ms is not None:
-                stream._opts.vad_silence_ms = vad_silence_ms
+            for attr, val in (
+                ("model", model),
+                ("language", language),
+                ("interim_results", interim_results),
+                ("endpointing_ms", endpointing_ms),
+                ("smart_turn", smart_turn),
+                ("hotwords", list(hotwords) if hotwords is not None else None),
+            ):
+                if val is not None:
+                    setattr(stream._opts, attr, val)
             stream._reconnect_event.set()
 
     def stream(
@@ -360,17 +430,28 @@ class STT(stt.STT):
         *,
         language: NotGivenOr[str] = NOT_GIVEN,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
-    ) -> SpeechStream:
+    ) -> stt.SpeechStream:
         opts = replace(self._opts)
         if is_given(language):
             opts.language = language
-        speech_stream = SpeechStream(
-            stt=self,
-            opts=opts,
-            conn_options=conn_options,
-            http_session=self._ensure_session(),
-            energy_filter=self._energy_filter,
-        )
+        speech_stream: stt.SpeechStream
+        if opts.mode == "streaming":
+            from ._listen import ListenStream
+
+            speech_stream = ListenStream(
+                stt_impl=self,
+                opts=opts,
+                conn_options=conn_options,
+                http_session=self._ensure_session(),
+            )
+        else:
+            speech_stream = SpeechStream(
+                stt=self,
+                opts=opts,
+                conn_options=conn_options,
+                http_session=self._ensure_session(),
+                energy_filter=self._energy_filter,
+            )
         self._streams.add(speech_stream)
         return speech_stream
 
@@ -464,109 +545,10 @@ class SpeechStream(stt.SpeechStream):
             )
         )
 
-    def _build_url_and_headers(self) -> tuple[str, dict[str, str]]:
-        params: dict[str, str] = {"model": str(self._opts.model)}
-        if self._opts.extra_query_params:
-            params.update(self._opts.extra_query_params)
-        headers: dict[str, str] = {}
-        if self._opts.auth_method == "header":
-            headers["x-api-key"] = self._opts.api_key
-        elif self._opts.auth_method == "bearer":
-            headers["Authorization"] = f"Bearer {self._opts.api_key}"
-        else:  # "query"
-            params["token"] = self._opts.api_key
-        url = f"{self._opts.base_url}?{urlencode(params)}"
-        return url, headers
-
     async def _run(self) -> None:
-        if self._opts.mode == "batch":
-            await self._run_batch()
-            return
-        if self._opts.endpointing == "client_vad":
-            await self._run_client_vad()
-            return
-        # server_diff (existing path):
-        backoff = self._initial_backoff
-        while True:
-            try:
-                await self._connect_and_run_once()
-                # Clean exit (input channel closed) — break the reconnect loop.
-                break
-            except APIStatusError:
-                # Auth failures (401/403) and application-level API errors propagate
-                # immediately without retry; connection-level 5xx errors from the WS
-                # handshake are converted to APIConnectionError in _connect_and_run_once.
-                raise
-            except (APIConnectionError, APITimeoutError) as e:
-                # If the connection was healthy long enough (> 10 s), treat the next
-                # failure as transient and restart backoff from the initial value.
-                if (
-                    self._last_connect_succeeded_at > 0
-                    and time.monotonic() - self._last_connect_succeeded_at > 10.0
-                ):
-                    backoff = self._initial_backoff
-                logger.warning("Munsit connection error (%s), reconnecting in %.1fs", e, backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, self._max_backoff)
-
-    async def _connect_and_run_once(self) -> None:
-        url, headers = self._build_url_and_headers()
-        try:
-            async with self._session.ws_connect(
-                url,
-                headers=headers,
-                timeout=aiohttp.ClientWSTimeout(
-                    ws_receive=self._conn_options.timeout * 5, ws_close=10
-                ),
-            ) as ws:
-                self._ws = ws
-                self._last_connect_succeeded_at = time.monotonic()
-                self._request_id = utils.shortuuid()
-                self._first_chunk_sent = False
-                self._last_cumulative = ""
-                self._speaking = False
-
-                send_task = asyncio.create_task(self._send_audio_task())
-                recv_task = asyncio.create_task(self._recv_messages_task())
-                idle_task: asyncio.Task[None] | None = None
-                if self._opts.endpointing == "server_diff":
-                    idle_task = asyncio.create_task(self._idle_finalize_task())
-                reconnect_wait = asyncio.create_task(self._reconnect_event.wait())
-                tasks: list[asyncio.Task] = [send_task, recv_task, reconnect_wait]
-                if idle_task is not None:
-                    tasks.append(idle_task)
-                try:
-                    done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                    for task in done:
-                        if not task.cancelled():
-                            task.result()
-                    if self._reconnect_event.is_set():
-                        self._reconnect_event.clear()
-                        # Surface as a clean connection error so the outer loop reconnects.
-                        raise APIConnectionError("Munsit options changed, reconnecting")
-                    # If send completed (input channel drained by aclose), give the
-                    # server a final window to emit transcripts. Without this, fast
-                    # consumer-side close paths (push audio → short wait → aclose)
-                    # tear down the WS before slow first-response from Munsit, and
-                    # the consumer sees no FINAL_TRANSCRIPT at all.
-                    if send_task in done and self._opts.endpointing == "server_diff":
-                        await self._drain_pending_transcripts()
-                finally:
-                    await utils.aio.gracefully_cancel(*tasks)
-                    self._ws = None
-        except aiohttp.WSServerHandshakeError as e:
-            if e.status in (401, 403):
-                raise APIStatusError(
-                    message=f"Munsit auth rejected: {e.message}",
-                    status_code=e.status,
-                    request_id=None,
-                    body=None,
-                ) from e
-            raise APIConnectionError(f"Munsit handshake failed: {e}") from e
-        except asyncio.TimeoutError as e:
-            raise APITimeoutError() from e
-        except aiohttp.ClientError as e:
-            raise APIConnectionError(f"Munsit connection error: {e}") from e
+        # SpeechStream is the batch-mode implementation; mode="streaming" uses
+        # ListenStream (see _listen.py) against WS /api/v1/listen.
+        await self._run_batch()
 
     async def _run_batch(self) -> None:
         """Batch mode: buffer audio per utterance, POST WAV when speech ends.
@@ -665,250 +647,3 @@ class SpeechStream(stt.SpeechStream):
             stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id)
         )
         self._batch_buffer = None
-
-    async def _run_client_vad(self) -> None:
-        # Lazy default if energy_filter wasn't passed but mode is client_vad
-        if self._energy_filter is None:
-            self._energy_filter = AudioEnergyFilter(min_silence=self._opts.vad_silence_ms / 1000.0)
-
-        utterance_recv_task: asyncio.Task[None] | None = None
-
-        async def _close_current_utterance() -> None:
-            nonlocal utterance_recv_task
-            if self._last_cumulative and self._speaking:
-                self._emit_final(self._last_cumulative)
-            if self._ws is not None:
-                try:
-                    await self._ws.close()
-                except Exception:
-                    pass
-                self._ws = None
-            if utterance_recv_task is not None:
-                try:
-                    await utterance_recv_task
-                except (asyncio.CancelledError, APIConnectionError):
-                    pass
-                except Exception as e:
-                    logger.warning("Munsit utterance recv task error: %s", e)
-                utterance_recv_task = None
-
-        async for data in self._input_ch:
-            if isinstance(data, rtc.AudioFrame):
-                state = self._energy_filter.update(data)
-                if state == AudioEnergyFilter.State.START and not self._vad_state_active:
-                    # Open a fresh WS for this utterance.
-                    try:
-                        url, headers = self._build_url_and_headers()
-                        self._ws = await self._session.ws_connect(
-                            url,
-                            headers=headers,
-                            timeout=aiohttp.ClientWSTimeout(
-                                ws_receive=self._conn_options.timeout * 5, ws_close=10
-                            ),
-                        )
-                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                        logger.warning(
-                            "Munsit ws_connect failed in client_vad (%s); skipping utterance", e
-                        )
-                        self._ws = None
-                        continue
-                    self._request_id = utils.shortuuid()
-                    self._first_chunk_sent = False
-                    self._last_cumulative = ""
-                    self._speaking = False
-                    utterance_recv_task = asyncio.create_task(self._recv_messages_task())
-                    self._vad_state_active = True
-                    await self._send_audio_frame(data)
-                elif state == AudioEnergyFilter.State.SPEAKING and self._vad_state_active:
-                    await self._send_audio_frame(data)
-                elif state == AudioEnergyFilter.State.END and self._vad_state_active:
-                    await _close_current_utterance()
-                    self._vad_state_active = False
-            elif isinstance(data, self._FlushSentinel):
-                if self._vad_state_active:
-                    await _close_current_utterance()
-                    self._vad_state_active = False
-
-        if self._vad_state_active:
-            await _close_current_utterance()
-            self._vad_state_active = False
-
-    async def _send_audio_task(self) -> None:
-        if not self._ws:
-            return
-        async for data in self._input_ch:
-            if not self._ws or self._ws.closed:
-                break
-            if isinstance(data, rtc.AudioFrame):
-                await self._send_audio_frame(data)
-            elif isinstance(data, self._FlushSentinel):
-                if self._last_cumulative and self._speaking:
-                    self._emit_final(self._last_cumulative)
-
-    async def _send_audio_frame(self, frame: rtc.AudioFrame) -> None:
-        if not self._ws:
-            return
-        pcm = bytes(frame.data)
-        self._ensure_usage_collector().push(frame.duration)
-        if not self._first_chunk_sent:
-            # Build the WAV header from the actual frame metadata, not the constructor
-            # defaults. AgentSession-driven frames will match self._opts; file-based
-            # demos may have different sample rates (e.g. a 24kHz WAV) and the header
-            # must declare what's really on the wire or Munsit will mis-decode.
-            if frame.sample_rate != self._opts.sample_rate:
-                logger.info(
-                    "Munsit first frame sample_rate=%d differs from configured %d; "
-                    "using frame's rate in WAV header.",
-                    frame.sample_rate,
-                    self._opts.sample_rate,
-                )
-            header = build_wav_header(
-                sample_rate=frame.sample_rate, num_channels=frame.num_channels
-            )
-            payload = header + pcm
-            self._first_chunk_sent = True
-        else:
-            payload = pcm
-        message = {"event": "audio_chunk", "data": {"audioBuffer": pcm_to_audiobuffer(payload)}}
-        await self._ws.send_str(json.dumps(message))
-
-    async def _recv_messages_task(self) -> None:
-        if not self._ws:
-            return
-        async for msg in self._ws:
-            if msg.type == aiohttp.WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                except json.JSONDecodeError:
-                    logger.warning("Munsit sent non-JSON text frame: %r", msg.data[:100])
-                    continue
-                event = data.get("event") or data.get("type")
-                payload = data.get("data") if data.get("data") is not None else data.get("text", "")
-                if event == "transcription":
-                    self._handle_transcription(payload if isinstance(payload, str) else "")
-                elif event == "transcription_error":
-                    err_text = payload if isinstance(payload, str) else json.dumps(payload)
-                    raise APIStatusError(
-                        message=f"Munsit transcription_error: {err_text}",
-                        status_code=500,
-                        request_id=self._request_id,
-                        body=None,
-                    )
-            elif msg.type in (
-                aiohttp.WSMsgType.CLOSE,
-                aiohttp.WSMsgType.CLOSED,
-                aiohttp.WSMsgType.CLOSING,
-            ):
-                break
-        # The async-for loop exited, meaning the server closed the WS connection.
-        # Treat this as a recoverable drop so the outer reconnect loop can re-connect.
-        raise APIConnectionError("Munsit WS closed unexpectedly")
-
-    def _handle_transcription(self, cumulative: str) -> None:
-        if cumulative == self._last_cumulative:
-            return
-        self._last_cumulative = cumulative
-        self._last_msg_at = time.monotonic()
-        if not cumulative:
-            return
-        if not self._speaking:
-            self._speaking = True
-            self._event_ch.send_nowait(
-                stt.SpeechEvent(
-                    type=stt.SpeechEventType.START_OF_SPEECH, request_id=self._request_id
-                )
-            )
-        if self._opts.interim_results:
-            self._event_ch.send_nowait(
-                stt.SpeechEvent(
-                    type=stt.SpeechEventType.INTERIM_TRANSCRIPT,
-                    request_id=self._request_id,
-                    alternatives=[self._make_speech_data(cumulative)],
-                )
-            )
-
-    def _make_speech_data(self, text: str) -> stt.SpeechData:
-        lang = self._opts.language or "ar"
-        return stt.SpeechData(
-            language=LanguageCode(lang),
-            start_time=0.0,
-            end_time=0.0,
-            confidence=1.0,
-            text=text,
-            words=[],
-        )
-
-    async def _idle_finalize_task(self) -> None:
-        threshold = self._opts.finalize_after_silence_ms / 1000.0
-        while True:
-            await asyncio.sleep(0.05)
-            if not self._speaking or not self._last_cumulative:
-                continue
-            if (time.monotonic() - self._last_msg_at) >= threshold:
-                self._emit_final(self._last_cumulative)
-
-    async def _drain_pending_transcripts(self) -> None:
-        """Wait for the server to emit a final transcript after audio stream closes.
-
-        Called when ``_send_audio_task`` exits cleanly (input channel drained by
-        ``aclose``). The recv and idle tasks are still running while this method
-        runs; we just give them a chance to receive and finalize incoming
-        transcripts before the outer ``finally`` block tears them down.
-
-        Without this, a consumer pattern like::
-
-            for chunk in audio_stream:
-                stt_stream.push_frame(chunk)
-            await asyncio.sleep(0.5)  # too short for a slow first response
-            await stt_stream.aclose()
-
-        could close the WS before Munsit emits even the first ``transcription``
-        event, leaving the consumer with no FINAL_TRANSCRIPT.
-
-        Phases:
-          1. If no cumulative has arrived yet, wait up to ``DRAIN_FIRST_MSG_S``
-             seconds for the first one.
-          2. Once a cumulative is held, wait for the idle task to finalize it
-             (``finalize_after_silence_ms`` of server silence) plus a small
-             padding for refinements.
-          3. If a cumulative is still pending after the settle window, force-emit
-             it as FINAL so the consumer sees something.
-        """
-        DRAIN_FIRST_MSG_S = 5.0
-        SETTLE_PADDING_MS = 500
-
-        if not self._last_cumulative:
-            deadline = time.monotonic() + DRAIN_FIRST_MSG_S
-            while time.monotonic() < deadline:
-                if self._last_cumulative:
-                    break
-                if self._ws is None or self._ws.closed:
-                    break
-                await asyncio.sleep(0.05)
-
-        settle_deadline = (
-            time.monotonic() + (self._opts.finalize_after_silence_ms + SETTLE_PADDING_MS) / 1000.0
-        )
-        while time.monotonic() < settle_deadline:
-            if not self._last_cumulative or not self._speaking:
-                break
-            if self._ws is None or self._ws.closed:
-                break
-            await asyncio.sleep(0.05)
-
-        if self._last_cumulative and self._speaking:
-            self._emit_final(self._last_cumulative)
-
-    def _emit_final(self, text: str) -> None:
-        self._event_ch.send_nowait(
-            stt.SpeechEvent(
-                type=stt.SpeechEventType.FINAL_TRANSCRIPT,
-                request_id=self._request_id,
-                alternatives=[self._make_speech_data(text)],
-            )
-        )
-        self._event_ch.send_nowait(
-            stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id)
-        )
-        self._last_cumulative = ""
-        self._speaking = False
