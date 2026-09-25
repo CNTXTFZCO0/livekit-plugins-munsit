@@ -1,5 +1,6 @@
 # Copyright 2026 LiveKit, Inc.
 import asyncio
+import json
 import os
 import pathlib
 import struct
@@ -390,6 +391,229 @@ class TestListenStreamEvents:
             stop_type=SpeechEventType.FINAL_TRANSCRIPT,
             max_wait=4.0,
         )
+        assert any(e.type == SpeechEventType.FINAL_TRANSCRIPT for e in events)
+
+    async def test_speech_final_emits_end_of_speech_immediately_and_dedupes_utterance_end(
+        self, fake_munsit, http_session
+    ):
+        """speech_final=true -> END_OF_SPEECH right after the FINAL; the later UtteranceEnd
+        for the same turn must not produce a second END_OF_SPEECH."""
+        fake_munsit.state.on_audio_events = [
+            (1, {"type": "SpeechStarted", "channel": 0, "ts": 0.5}),
+            (1, _final_results_event(turn_id=7, speech_final=True)),
+            (1, {"type": "UtteranceEnd", "channel": 0, "turn_id": 7, "last_word_end": 1.1}),
+        ]
+        stt_inst = STT(
+            mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+        q: asyncio.Queue = asyncio.Queue()
+        events = await _drive_listen_stream(stream, [_silence_frame()], q, max_wait=4.0)
+
+        types = [e.type for e in events]
+        assert types.count(SpeechEventType.END_OF_SPEECH) == 1
+        final_idx = types.index(SpeechEventType.FINAL_TRANSCRIPT)
+        assert types[final_idx + 1] == SpeechEventType.END_OF_SPEECH
+
+    async def test_utterance_end_without_speech_final_emits_end_of_speech_once(
+        self, fake_munsit, http_session
+    ):
+        """A forced split (speech_final=false) followed by UtteranceEnd: END_OF_SPEECH comes
+        from the UtteranceEnd, exactly once."""
+        fake_munsit.state.on_audio_events = [
+            (1, _final_results_event(turn_id=0, speech_final=False)),
+            (1, {"type": "UtteranceEnd", "channel": 0, "turn_id": 0, "last_word_end": 1.1}),
+        ]
+        stt_inst = STT(
+            mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+        q: asyncio.Queue = asyncio.Queue()
+        events = await _drive_listen_stream(stream, [_silence_frame()], q, max_wait=4.0)
+
+        types = [e.type for e in events]
+        assert types.count(SpeechEventType.FINAL_TRANSCRIPT) == 1
+        assert types.count(SpeechEventType.END_OF_SPEECH) == 1
+        assert types.index(SpeechEventType.END_OF_SPEECH) > types.index(
+            SpeechEventType.FINAL_TRANSCRIPT
+        )
+
+    async def test_dedupe_is_per_turn(self, fake_munsit, http_session):
+        """Turn 0 ends via speech_final (UtteranceEnd deduped); turn 1 ends only via
+        UtteranceEnd and must still emit END_OF_SPEECH."""
+        fake_munsit.state.on_audio_events = [
+            (1, _final_results_event(turn_id=0, speech_final=True)),
+            (1, {"type": "UtteranceEnd", "channel": 0, "turn_id": 0, "last_word_end": 1.1}),
+            (1, _final_results_event(turn_id=1, speech_final=False)),
+            (1, {"type": "UtteranceEnd", "channel": 0, "turn_id": 1, "last_word_end": 2.4}),
+        ]
+        stt_inst = STT(
+            mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+        q: asyncio.Queue = asyncio.Queue()
+        events = await _drive_listen_stream(stream, [_silence_frame()], q, max_wait=4.0)
+
+        types = [e.type for e in events]
+        assert types.count(SpeechEventType.FINAL_TRANSCRIPT) == 2
+        assert types.count(SpeechEventType.END_OF_SPEECH) == 2
+
+
+def _interim_event(text: str, **overrides):
+    ev = {
+        "type": "Results",
+        "channel": 0,
+        "turn_id": 0,
+        "transcript": text,
+        "words": [],
+        "is_final": False,
+        "speech_final": False,
+        "language": "ar",
+        "confidence": None,
+    }
+    ev.update(overrides)
+    return ev
+
+
+class TestCaptionArtifactFilter:
+    _EVENTS = [
+        (1, _interim_event("[Music]")),
+        (1, _interim_event("[BLANK_AUDIO] (music)")),
+        (1, _interim_event(">> MICHAEL CARROLL:")),
+        (1, _interim_event(">> MICHAEL CARROLL: Thank you.")),
+        (1, _interim_event("[Music] hello")),  # real words after a tag: kept as-is
+        (
+            1,
+            _final_results_event(
+                transcript=">> MICHAEL CARROLL: Thank you.",
+                words=[
+                    {"word": ">>", "start": 0.0, "end": 0.1},
+                    {"word": "MICHAEL", "start": 0.1, "end": 0.3},
+                    {"word": "CARROLL:", "start": 0.3, "end": 0.5},
+                    {"word": "Thank", "start": 0.5, "end": 0.7},
+                    {"word": "you.", "start": 0.7, "end": 0.9},
+                ],
+            ),
+        ),
+        (1, _final_results_event(transcript="[Music]", words=[], turn_id=1)),
+    ]
+
+    async def _run(self, fake_munsit, http_session, **stt_kwargs):
+        fake_munsit.state.on_audio_events = list(self._EVENTS)
+        stt_inst = STT(
+            mode="streaming",
+            api_key="x",
+            base_url=fake_munsit.url,
+            http_session=http_session,
+            **stt_kwargs,
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+        q: asyncio.Queue = asyncio.Queue()
+        return await _drive_listen_stream(stream, [_silence_frame()], q, max_wait=4.0)
+
+    async def test_flag_on_drops_tag_only_interims_and_strips_speaker_tag(
+        self, fake_munsit, http_session
+    ):
+        events = await self._run(fake_munsit, http_session)
+        interims = [
+            e.alternatives[0].text for e in events if e.type == SpeechEventType.INTERIM_TRANSCRIPT
+        ]
+        assert interims == ["Thank you.", "[Music] hello"]
+
+        finals = [e for e in events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
+        assert [f.alternatives[0].text for f in finals] == ["Thank you.", "[Music]"]
+        # the stripped speaker-tag words are gone, real words keep their timings
+        assert [str(w) for w in finals[0].alternatives[0].words] == ["Thank", "you."]
+        assert finals[0].alternatives[0].start_time == 0.5
+
+    async def test_flag_off_passes_everything_through(self, fake_munsit, http_session):
+        events = await self._run(fake_munsit, http_session, filter_caption_artifacts=False)
+        interims = [
+            e.alternatives[0].text for e in events if e.type == SpeechEventType.INTERIM_TRANSCRIPT
+        ]
+        assert interims == [
+            "[Music]",
+            "[BLANK_AUDIO] (music)",
+            ">> MICHAEL CARROLL:",
+            ">> MICHAEL CARROLL: Thank you.",
+            "[Music] hello",
+        ]
+        finals = [e for e in events if e.type == SpeechEventType.FINAL_TRANSCRIPT]
+        assert finals[0].alternatives[0].text == ">> MICHAEL CARROLL: Thank you."
+        assert len(finals[0].alternatives[0].words) == 5
+
+
+class TestListenTrace:
+    async def test_trace_file_gets_rx_and_tx_lines_without_secrets(
+        self, fake_munsit, http_session, tmp_path, monkeypatch
+    ):
+        trace_path = tmp_path / "munsit-trace.jsonl"
+        monkeypatch.setenv("MUNSIT_TRACE_FILE", str(trace_path))
+        secret = "sk-live-do-not-leak-me"
+        fake_munsit.state.on_audio_events = [
+            (1, _final_results_event(turn_id=3, transcript="secret words too")),
+            (1, {"type": "UtteranceEnd", "channel": 0, "turn_id": 3, "last_word_end": 1.1}),
+        ]
+        stt_inst = STT(
+            mode="streaming",
+            api_key=secret,
+            auth_method="query",  # the key rides the URL: the trace must still not carry it
+            base_url=fake_munsit.url,
+            http_session=http_session,
+            correlation_id="call-42",
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+        q: asyncio.Queue = asyncio.Queue()
+        await _drive_listen_stream(stream, [_silence_frame()], q, max_wait=4.0)
+
+        raw = trace_path.read_text(encoding="utf-8")
+        assert secret not in raw
+        assert "api_key" not in raw
+        assert "call-42" not in raw  # no query string at all
+        assert "secret words too" not in raw  # never transcript text
+
+        lines = [json.loads(line) for line in raw.splitlines() if line.strip()]
+        assert all(
+            set(line) >= {"ts", "munsit_session_id", "request_id", "direction", "type"}
+            for line in lines
+        )
+        rx = [line for line in lines if line["direction"] == "rx"]
+        tx = [line for line in lines if line["direction"] == "tx"]
+        assert [line["type"] for line in rx] == ["Metadata", "Results", "UtteranceEnd", "Metadata"]
+        assert [line["type"] for line in tx] == ["CloseStream"]
+
+        results = next(line for line in rx if line["type"] == "Results")
+        assert results["turn_id"] == 3
+        assert results["is_final"] is True
+        assert results["speech_final"] is True
+        assert results["text_len"] == len("secret words too")
+        assert abs(results["confidence"] - 0.98) < 1e-6
+        # session id is learned from the open Metadata and stamped on later lines
+        assert results["munsit_session_id"] == "fake-session"
+
+    async def test_no_env_var_means_no_file(self, fake_munsit, http_session, tmp_path, monkeypatch):
+        monkeypatch.delenv("MUNSIT_TRACE_FILE", raising=False)
+        fake_munsit.state.on_audio_events = [(1, _final_results_event())]
+        stt_inst = STT(
+            mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+        q: asyncio.Queue = asyncio.Queue()
+        events = await _drive_listen_stream(stream, [_silence_frame()], q, max_wait=4.0)
+        assert any(e.type == SpeechEventType.FINAL_TRANSCRIPT for e in events)
+        assert list(tmp_path.iterdir()) == []
+
+    async def test_unwritable_path_never_raises(
+        self, fake_munsit, http_session, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("MUNSIT_TRACE_FILE", str(tmp_path / "missing-dir" / "t.jsonl"))
+        fake_munsit.state.on_audio_events = [(1, _final_results_event())]
+        stt_inst = STT(
+            mode="streaming", api_key="x", base_url=fake_munsit.url, http_session=http_session
+        )
+        stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
+        q: asyncio.Queue = asyncio.Queue()
+        events = await _drive_listen_stream(stream, [_silence_frame()], q, max_wait=4.0)
         assert any(e.type == SpeechEventType.FINAL_TRANSCRIPT for e in events)
 
 

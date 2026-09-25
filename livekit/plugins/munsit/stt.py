@@ -184,6 +184,7 @@ class _STTOptions:
     language: str | None
     extra_query_params: dict[str, str] | None
     on_enrichment: object | None = None  # callable(dict) for Sentiment/Gender events
+    filter_caption_artifacts: bool = True  # drop "[Music]" interims, strip ">> NAME:" tags
 
 
 class STT(stt.STT):
@@ -208,6 +209,7 @@ class STT(stt.STT):
         http_session: aiohttp.ClientSession | None = None,
         extra_query_params: dict[str, str] | None = None,
         on_enrichment: object | None = None,
+        filter_caption_artifacts: bool = True,
         # ── deprecated (0.3.x legacy socket) — accepted, mapped, warned ──
         endpointing: NotGivenOr[EndpointingMode] = NOT_GIVEN,
         finalize_after_silence_ms: NotGivenOr[int] = NOT_GIVEN,
@@ -250,6 +252,11 @@ class STT(stt.STT):
             extra_query_params: Forward-compat for new query params without an SDK update.
             on_enrichment: Optional callable receiving raw ``Sentiment``/``Gender`` event
                 dicts from the streaming session (they have no LiveKit event equivalent).
+            filter_caption_artifacts: Streaming mode — the code-switch model sometimes
+                emits caption-style hallucinations on interims before real words
+                (``"[Music]"``, ``"[BLANK_AUDIO]"``, ``">> NAME: ..."``). When on (default),
+                interims that are only bracketed tags are dropped and a leading speaker
+                tag is stripped from interims and finals. Finals are never dropped.
             endpointing: DEPRECATED (legacy socket). Ignored; server-side endpointing is
                 always used.
             finalize_after_silence_ms: DEPRECATED. Mapped to ``endpointing_ms`` if that was
@@ -361,6 +368,7 @@ class STT(stt.STT):
             language=language,
             extra_query_params=extra_query_params,
             on_enrichment=on_enrichment,
+            filter_caption_artifacts=filter_caption_artifacts,
         )
         if isinstance(energy_filter, AudioEnergyFilter):
             self._energy_filter: AudioEnergyFilter | None = energy_filter
