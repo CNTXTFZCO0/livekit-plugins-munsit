@@ -26,17 +26,23 @@ Event mapping to LiveKit:
   SpeechStarted                       -> START_OF_SPEECH
   Results (is_final=false)            -> INTERIM_TRANSCRIPT
   Results (is_final=true)             -> FINAL_TRANSCRIPT (words + confidence attached)
-  UtteranceEnd                        -> END_OF_SPEECH
+  Results (is_final + speech_final)   -> FINAL_TRANSCRIPT, then END_OF_SPEECH immediately
+  UtteranceEnd                        -> END_OF_SPEECH, unless the turn's speech_final final
+                                         already emitted it
   Results final with speech_final=false is a forced split during unbroken speech:
   FINAL_TRANSCRIPT is emitted but no END_OF_SPEECH (the speaker is still talking).
+
+There is no client-side finalize on this protocol (the only control messages are
+KeepAlive / Configure / CloseStream), so LiveKit's flush sentinel is ignored.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlencode
 
 import aiohttp
@@ -52,14 +58,49 @@ from livekit.agents import (
     utils,
 )
 
+from ._trace import Tracer
 from ._utils import PeriodicCollector
 from .log import logger
 
 if TYPE_CHECKING:
     from .stt import _STTOptions
 
-KEEPALIVE_INTERVAL_S = 5.0     # server closes after 12 s without audio or KeepAlive
+KEEPALIVE_INTERVAL_S = 5.0  # server closes after 12 s without audio or KeepAlive
 _TARGET_RATES = (8000, 16000)  # the only sample rates /listen accepts
+
+# Caption-style hallucinations the code-switch live model sometimes emits on interims
+# before any real words: text that is nothing but bracketed tags ("[Music]",
+# "[BLANK_AUDIO]", "(music)", possibly several), or a leading ">> SPEAKER NAME:" tag.
+_ONLY_CAPTION_TAGS_RE = re.compile(r"^(?:\s*(?:\[[^\]]*\]|\([^)]*\)))+\s*$")
+_SPEAKER_TAG_RE = re.compile(r"^\s*>>\s*[^:\n]{0,80}:\s*")
+_NO_TURN = object()  # sentinel: no speech_final END_OF_SPEECH is pending
+
+
+def _strip_caption_artifacts(text: str, *, is_final: bool) -> str | None:
+    """Return the cleaned transcript, or None if an interim should be dropped entirely.
+
+    Finals are never dropped (the server has committed the turn; a caption-only final is
+    a real, if empty, turn boundary) — only the leading speaker tag is removed from them.
+    """
+    if not is_final and _ONLY_CAPTION_TAGS_RE.match(text):
+        logger.debug("Munsit interim dropped (caption artifact): %r", text)
+        return None
+    cleaned, n = _SPEAKER_TAG_RE.subn("", text, count=1)
+    if n:
+        logger.debug(
+            "Munsit speaker tag stripped from %s: %r", "final" if is_final else "interim", text
+        )
+        if not is_final and not cleaned.strip():
+            return None
+    return cleaned
+
+
+def _drop_prefix_words(words: list[dict], prefix: str) -> list[dict]:
+    """Drop leading word entries that spell a stripped prefix, keeping timings aligned."""
+    tokens = prefix.split()
+    if tokens and [w.get("word") for w in words[: len(tokens)]] == tokens:
+        return words[len(tokens) :]
+    return words
 
 
 class ListenStream(stt.SpeechStream):
@@ -81,15 +122,17 @@ class ListenStream(stt.SpeechStream):
         self._request_id: str = utils.shortuuid()
         self._resampler: rtc.AudioResampler | None = None
         self._resampler_input_rate: int | None = None
-        self._target_rate: int = (
-            opts.sample_rate if opts.sample_rate in _TARGET_RATES else 16000
-        )
+        self._target_rate: int = opts.sample_rate if opts.sample_rate in _TARGET_RATES else 16000
         self._usage_collector = PeriodicCollector[float](
             callback=self._on_audio_duration_report, duration=5.0
         )
         self._initial_backoff = 1.0
         self._max_backoff = 30.0
         self._last_connect_succeeded_at = 0.0
+        # turn_id whose speech_final final already emitted END_OF_SPEECH; the matching
+        # UtteranceEnd must not emit a second one.
+        self._eos_emitted_for_turn: Any = _NO_TURN
+        self._trace = Tracer(request_id=self._request_id)
 
     # ── connection ───────────────────────────────────────────────────────────
 
@@ -133,21 +176,24 @@ class ListenStream(stt.SpeechStream):
 
     async def _run(self) -> None:
         backoff = self._initial_backoff
-        while True:
-            try:
-                await self._connect_and_run_once()
-                break  # input channel drained; clean exit
-            except APIStatusError:
-                raise  # auth/policy rejections don't retry
-            except (APIConnectionError, APITimeoutError) as e:
-                if (
-                    self._last_connect_succeeded_at > 0
-                    and time.monotonic() - self._last_connect_succeeded_at > 10.0
-                ):
-                    backoff = self._initial_backoff
-                logger.warning("Munsit /listen error (%s), reconnecting in %.1fs", e, backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, self._max_backoff)
+        try:
+            while True:
+                try:
+                    await self._connect_and_run_once()
+                    break  # input channel drained; clean exit
+                except APIStatusError:
+                    raise  # auth/policy rejections don't retry
+                except (APIConnectionError, APITimeoutError) as e:
+                    if (
+                        self._last_connect_succeeded_at > 0
+                        and time.monotonic() - self._last_connect_succeeded_at > 10.0
+                    ):
+                        backoff = self._initial_backoff
+                    logger.warning("Munsit /listen error (%s), reconnecting in %.1fs", e, backoff)
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, self._max_backoff)
+        finally:
+            self._trace.close()
 
     async def _connect_and_run_once(self) -> None:
         url, headers = self._build_url_and_headers()
@@ -239,14 +285,22 @@ class ListenStream(stt.SpeechStream):
                 for out in self._resample(data):
                     await ws.send_bytes(bytes(out.data))
             elif isinstance(data, self._FlushSentinel):
-                # Server-side endpointing decides finality; nothing to flush.
+                # /listen has no Finalize message; server-side endpointing decides
+                # finality, so LiveKit's flush is a no-op here.
                 continue
         ws = self._ws
         if ws is not None and not ws.closed:
             if self._resampler is not None:
                 for out in self._resampler.flush():
                     await ws.send_bytes(bytes(out.data))
-            await ws.send_str(json.dumps({"type": "CloseStream"}))
+            await self._send_control(ws, {"type": "CloseStream"})
+
+    async def _send_control(
+        self, ws: aiohttp.ClientWebSocketResponse, message: dict[str, Any]
+    ) -> None:
+        """Send a JSON control frame (KeepAlive / Configure / CloseStream) and trace it."""
+        self._trace.write("tx", message)
+        await ws.send_str(json.dumps(message))
 
     async def _keepalive_task(self) -> None:
         while True:
@@ -254,7 +308,7 @@ class ListenStream(stt.SpeechStream):
             ws = self._ws
             if ws is None or ws.closed:
                 return
-            await ws.send_str(json.dumps({"type": "KeepAlive"}))
+            await self._send_control(ws, {"type": "KeepAlive"})
 
     # ── receiving ────────────────────────────────────────────────────────────
 
@@ -282,6 +336,9 @@ class ListenStream(stt.SpeechStream):
 
     def _handle_event(self, event: dict) -> bool:
         etype = event.get("type")
+        if etype == "Metadata" and event.get("session_id"):
+            self._trace.session_id = str(event["session_id"])
+        self._trace.write("rx", event)
         if etype == "Metadata":
             if "audio_seconds_billed" in event:
                 logger.debug(
@@ -310,11 +367,18 @@ class ListenStream(stt.SpeechStream):
         elif etype == "Results":
             self._handle_results(event)
         elif etype == "UtteranceEnd":
-            self._event_ch.send_nowait(
-                stt.SpeechEvent(
-                    type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id
+            if (
+                self._eos_emitted_for_turn is not _NO_TURN
+                and event.get("turn_id") == self._eos_emitted_for_turn
+            ):
+                # Already emitted on this turn's speech_final final.
+                self._eos_emitted_for_turn = _NO_TURN
+                logger.debug(
+                    "Munsit UtteranceEnd turn=%s: END_OF_SPEECH already emitted",
+                    event.get("turn_id"),
                 )
-            )
+            else:
+                self._emit_end_of_speech()
         elif etype in ("Sentiment", "Gender"):
             # Not representable as LiveKit SpeechEvents; surfaced via the optional
             # callback for voice-analytics consumers.
@@ -337,16 +401,29 @@ class ListenStream(stt.SpeechStream):
                 )
         return False
 
+    def _emit_end_of_speech(self) -> None:
+        self._event_ch.send_nowait(
+            stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id)
+        )
+
     def _handle_results(self, event: dict) -> None:
         text = event.get("transcript", "") or ""
         is_final = bool(event.get("is_final"))
         if not text and not is_final:
             return
+        raw_words: list[dict] = event.get("words") or []
+        if self._opts.filter_caption_artifacts:
+            cleaned = _strip_caption_artifacts(text, is_final=is_final)
+            if cleaned is None:
+                return
+            if cleaned != text:
+                raw_words = _drop_prefix_words(raw_words, text[: len(text) - len(cleaned)])
+            text = cleaned
 
         from livekit.agents.voice.io import TimedString
 
         words: list[TimedString] = []
-        for w in event.get("words") or []:
+        for w in raw_words:
             word = w.get("word")
             start = w.get("start")
             end = w.get("end")
@@ -377,6 +454,12 @@ class ListenStream(stt.SpeechStream):
                 alternatives=[data],
             )
         )
+        if is_final and event.get("speech_final"):
+            # speech_final marks a genuine end of turn. The server's UtteranceEnd for the
+            # same turn follows only after its silence window, so emitting END_OF_SPEECH
+            # here saves that wait; the later UtteranceEnd is then deduplicated.
+            self._eos_emitted_for_turn = event.get("turn_id")
+            self._emit_end_of_speech()
 
     # ── misc ─────────────────────────────────────────────────────────────────
 
@@ -397,4 +480,4 @@ class ListenStream(stt.SpeechStream):
         self._opts.endpointing_ms = endpointing_ms
         ws = self._ws
         if ws is not None and not ws.closed:
-            await ws.send_str(json.dumps({"type": "Configure", "endpointing": endpointing_ms}))
+            await self._send_control(ws, {"type": "Configure", "endpointing": endpointing_ms})

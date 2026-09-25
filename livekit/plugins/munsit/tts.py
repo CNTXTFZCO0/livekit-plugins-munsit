@@ -45,8 +45,8 @@ API_BASE_URL = "https://api.faseeh.ai/api/v1"
 API_KEY_HEADER = "x-api-key"
 
 # Chunking delimiters for streaming
-HARD_DELIMITERS = {'.', '!', '؟', '\n'}  # Sentence endings and line breaks
-SOFT_DELIMITERS = {',', '،', ';', '؛', ':', '—', '–'}  # Phrase boundaries
+HARD_DELIMITERS = {".", "!", "؟", "\n"}  # Sentence endings and line breaks
+SOFT_DELIMITERS = {",", "،", ";", "؛", ":", "—", "–"}  # Phrase boundaries
 
 # Word count thresholds for chunking
 HARD_WORD_THRESHOLD = 16
@@ -107,8 +107,11 @@ class TTS(tts.TTS):
             num_channels=1,
         )
 
-        faseeh_api_key = (api_key if is_given(api_key)
-                  else os.environ.get("MUNSIT_API_KEY") or os.environ.get("FASEEH_API_KEY"))
+        faseeh_api_key = (
+            api_key
+            if is_given(api_key)
+            else os.environ.get("MUNSIT_API_KEY") or os.environ.get("FASEEH_API_KEY")
+        )
         if not faseeh_api_key:
             raise ValueError(
                 "API key is required: pass api_key or set MUNSIT_API_KEY (or legacy FASEEH_API_KEY)"
@@ -337,7 +340,7 @@ class SynthesizeStream(tts.SynthesizeStream):
 
         if pos:
             # Normalize whitespace (replace newlines/multiple spaces with single space)
-            chunk = ' '.join(text[:pos].split())
+            chunk = " ".join(text[:pos].split())
             buffer = text[pos:].lstrip()  # Remove leading whitespace from buffer
             return chunk, buffer
 
@@ -470,8 +473,8 @@ class SynthesizeStream(tts.SynthesizeStream):
                     chunk_to_send, buffer = self._split_on_delimiters(buffer, SOFT_DELIMITERS)
 
                 if not chunk_to_send and word_count >= self._tts._opts.safety_word_threshold:
-                    chunk_to_send = ' '.join(words[:-3])
-                    buffer = ' '.join(words[-3:])
+                    chunk_to_send = " ".join(words[:-3])
+                    buffer = " ".join(words[-3:])
 
                 if chunk_to_send:
                     await chunk_queue.put(chunk_to_send)

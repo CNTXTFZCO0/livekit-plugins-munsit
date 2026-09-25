@@ -7,7 +7,6 @@ JSON control frames); HTTP side emulates ``POST /api/v1/audio/transcribe``.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import Any

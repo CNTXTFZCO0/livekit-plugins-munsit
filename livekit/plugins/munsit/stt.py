@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import time
 import weakref
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -39,7 +38,6 @@ from livekit.agents import (
 from livekit.agents.utils import is_given
 
 from ._utils import AudioEnergyFilter, PeriodicCollector, build_wav_header
-from .log import logger
 from .models import MunsitModels
 
 DEFAULT_BASE_URL = "wss://api.munsit.com/api/v1/listen"
@@ -185,7 +183,8 @@ class _STTOptions:
     return_confidence: bool
     language: str | None
     extra_query_params: dict[str, str] | None
-    on_enrichment: object | None = None   # callable(dict) for Sentiment/Gender events
+    on_enrichment: object | None = None  # callable(dict) for Sentiment/Gender events
+    filter_caption_artifacts: bool = True  # drop "[Music]" interims, strip ">> NAME:" tags
 
 
 class STT(stt.STT):
@@ -210,6 +209,7 @@ class STT(stt.STT):
         http_session: aiohttp.ClientSession | None = None,
         extra_query_params: dict[str, str] | None = None,
         on_enrichment: object | None = None,
+        filter_caption_artifacts: bool = True,
         # ── deprecated (0.3.x legacy socket) — accepted, mapped, warned ──
         endpointing: NotGivenOr[EndpointingMode] = NOT_GIVEN,
         finalize_after_silence_ms: NotGivenOr[int] = NOT_GIVEN,
@@ -252,6 +252,11 @@ class STT(stt.STT):
             extra_query_params: Forward-compat for new query params without an SDK update.
             on_enrichment: Optional callable receiving raw ``Sentiment``/``Gender`` event
                 dicts from the streaming session (they have no LiveKit event equivalent).
+            filter_caption_artifacts: Streaming mode — the code-switch model sometimes
+                emits caption-style hallucinations on interims before real words
+                (``"[Music]"``, ``"[BLANK_AUDIO]"``, ``">> NAME: ..."``). When on (default),
+                interims that are only bracketed tags are dropped and a leading speaker
+                tag is stripped from interims and finals. Finals are never dropped.
             endpointing: DEPRECATED (legacy socket). Ignored; server-side endpointing is
                 always used.
             finalize_after_silence_ms: DEPRECATED. Mapped to ``endpointing_ms`` if that was
@@ -277,8 +282,9 @@ class STT(stt.STT):
             if endpointing_ms == DEFAULT_ENDPOINTING_MS:
                 endpointing_ms = max(100, min(5000, int(finalize_after_silence_ms)))
         if is_given(vad_silence_ms):
-            warnings.warn("vad_silence_ms is deprecated and ignored.", DeprecationWarning,
-                          stacklevel=2)
+            warnings.warn(
+                "vad_silence_ms is deprecated and ignored.", DeprecationWarning, stacklevel=2
+            )
         if energy_filter is not False:
             warnings.warn(
                 "energy_filter is deprecated: batch mode uses an internal energy VAD and "
@@ -362,6 +368,7 @@ class STT(stt.STT):
             language=language,
             extra_query_params=extra_query_params,
             on_enrichment=on_enrichment,
+            filter_caption_artifacts=filter_caption_artifacts,
         )
         if isinstance(energy_filter, AudioEnergyFilter):
             self._energy_filter: AudioEnergyFilter | None = energy_filter
