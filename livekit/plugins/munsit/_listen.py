@@ -58,7 +58,7 @@ from .log import logger
 if TYPE_CHECKING:
     from .stt import _STTOptions
 
-KEEPALIVE_INTERVAL_S = 5.0     # server closes after 12 s without audio or KeepAlive
+KEEPALIVE_INTERVAL_S = 5.0  # server closes after 12 s without audio or KeepAlive
 _TARGET_RATES = (8000, 16000)  # the only sample rates /listen accepts
 
 
@@ -81,9 +81,7 @@ class ListenStream(stt.SpeechStream):
         self._request_id: str = utils.shortuuid()
         self._resampler: rtc.AudioResampler | None = None
         self._resampler_input_rate: int | None = None
-        self._target_rate: int = (
-            opts.sample_rate if opts.sample_rate in _TARGET_RATES else 16000
-        )
+        self._target_rate: int = opts.sample_rate if opts.sample_rate in _TARGET_RATES else 16000
         self._usage_collector = PeriodicCollector[float](
             callback=self._on_audio_duration_report, duration=5.0
         )
@@ -311,9 +309,7 @@ class ListenStream(stt.SpeechStream):
             self._handle_results(event)
         elif etype == "UtteranceEnd":
             self._event_ch.send_nowait(
-                stt.SpeechEvent(
-                    type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id
-                )
+                stt.SpeechEvent(type=stt.SpeechEventType.END_OF_SPEECH, request_id=self._request_id)
             )
         elif etype in ("Sentiment", "Gender"):
             # Not representable as LiveKit SpeechEvents; surfaced via the optional

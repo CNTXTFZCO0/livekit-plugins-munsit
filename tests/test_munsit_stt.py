@@ -1,13 +1,11 @@
 # Copyright 2026 LiveKit, Inc.
 import asyncio
-import json as _json
 import os
 import pathlib
 import struct
 import wave
 from unittest.mock import patch
 
-import aiohttp
 import pytest
 
 from livekit import rtc
@@ -230,7 +228,6 @@ def _loud_frame(duration_ms: int = 100, sample_rate: int = 16000) -> rtc.AudioFr
     )
 
 
-
 # ---------------------------------------------------------------------------
 # Streaming mode tests — exercise the WS /api/v1/listen path (ListenStream).
 # ---------------------------------------------------------------------------
@@ -286,10 +283,20 @@ class TestListenStreamEvents:
         UtteranceEnd -> END_OF_SPEECH."""
         fake_munsit.state.on_audio_events = [
             (1, {"type": "SpeechStarted", "channel": 0, "ts": 0.5}),
-            (1, {"type": "Results", "channel": 0, "turn_id": 0, "transcript": "لا",
-                 "words": [{"word": "لا", "start": 0.1, "end": 0.3, "confidence": 1.0}],
-                 "is_final": False, "speech_final": False, "language": "ar",
-                 "confidence": None}),
+            (
+                1,
+                {
+                    "type": "Results",
+                    "channel": 0,
+                    "turn_id": 0,
+                    "transcript": "لا",
+                    "words": [{"word": "لا", "start": 0.1, "end": 0.3, "confidence": 1.0}],
+                    "is_final": False,
+                    "speech_final": False,
+                    "language": "ar",
+                    "confidence": None,
+                },
+            ),
             (1, _final_results_event()),
             (1, {"type": "UtteranceEnd", "channel": 0, "turn_id": 0, "last_word_end": 1.1}),
         ]
@@ -299,7 +306,9 @@ class TestListenStreamEvents:
         stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
         q: asyncio.Queue = asyncio.Queue()
         events = await _drive_listen_stream(
-            stream, [_silence_frame() for _ in range(3)], q,
+            stream,
+            [_silence_frame() for _ in range(3)],
+            q,
             stop_type=SpeechEventType.END_OF_SPEECH,
         )
 
@@ -316,9 +325,7 @@ class TestListenStreamEvents:
         assert sd.words[0].start_time == 0.1
         assert abs(sd.confidence - 0.98) < 1e-6
 
-    async def test_forced_split_emits_final_without_end_of_speech(
-        self, fake_munsit, http_session
-    ):
+    async def test_forced_split_emits_final_without_end_of_speech(self, fake_munsit, http_session):
         fake_munsit.state.on_audio_events = [
             (1, _final_results_event(speech_final=False)),
         ]
@@ -340,13 +347,24 @@ class TestListenStreamEvents:
             (1, _final_results_event()),
             (1, {"type": "UtteranceEnd", "channel": 0, "turn_id": 0, "last_word_end": 1.1}),
             (1, {"type": "Gender", "channel": 0, "turn_id": 0, "label": "female", "score": 0.99}),
-            (1, {"type": "Sentiment", "channel": 0, "turn_id": 0, "label": "negative",
-                 "score": 0.9}),
+            (
+                1,
+                {
+                    "type": "Sentiment",
+                    "channel": 0,
+                    "turn_id": 0,
+                    "label": "negative",
+                    "score": 0.9,
+                },
+            ),
         ]
         enriched: list = []
         stt_inst = STT(
-            mode="streaming", api_key="x", base_url=fake_munsit.url,
-            http_session=http_session, on_enrichment=enriched.append,
+            mode="streaming",
+            api_key="x",
+            base_url=fake_munsit.url,
+            http_session=http_session,
+            on_enrichment=enriched.append,
         )
         stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
         q: asyncio.Queue = asyncio.Queue()
@@ -357,8 +375,7 @@ class TestListenStreamEvents:
 
     async def test_recoverable_error_does_not_raise(self, fake_munsit, http_session):
         fake_munsit.state.on_audio_events = [
-            (1, {"type": "Error", "code": 4002, "message": "bad configure",
-                 "recoverable": True}),
+            (1, {"type": "Error", "code": 4002, "message": "bad configure", "recoverable": True}),
             (1, _final_results_event()),
         ]
         stt_inst = STT(
@@ -367,7 +384,10 @@ class TestListenStreamEvents:
         stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
         q: asyncio.Queue = asyncio.Queue()
         events = await _drive_listen_stream(
-            stream, [_silence_frame()], q, stop_type=SpeechEventType.FINAL_TRANSCRIPT,
+            stream,
+            [_silence_frame()],
+            q,
+            stop_type=SpeechEventType.FINAL_TRANSCRIPT,
             max_wait=4.0,
         )
         assert any(e.type == SpeechEventType.FINAL_TRANSCRIPT for e in events)
@@ -445,7 +465,8 @@ class TestListenConnection:
         await _drive_listen_stream(
             stream,
             [_silence_frame(duration_ms=100, sample_rate=48000) for _ in range(n_frames)],
-            q, max_wait=3.0,
+            q,
+            max_wait=3.0,
         )
         sent = fake_munsit.state.listen_binary_bytes
         expected = n_frames * 1600 * 2  # 100ms at 16k, 16-bit
@@ -455,7 +476,9 @@ class TestListenConnection:
     async def test_header_auth(self, fake_munsit, http_session):
         fake_munsit.state.require_api_key = "secret"
         stt_inst = STT(
-            mode="streaming", api_key="secret", base_url=fake_munsit.url,
+            mode="streaming",
+            api_key="secret",
+            base_url=fake_munsit.url,
             http_session=http_session,
         )
         stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
@@ -466,8 +489,11 @@ class TestListenConnection:
     async def test_query_auth_uses_api_key_param(self, fake_munsit, http_session):
         fake_munsit.state.require_api_key = "qk"
         stt_inst = STT(
-            mode="streaming", api_key="qk", base_url=fake_munsit.url,
-            http_session=http_session, auth_method="query",
+            mode="streaming",
+            api_key="qk",
+            base_url=fake_munsit.url,
+            http_session=http_session,
+            auth_method="query",
         )
         stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))
         q: asyncio.Queue = asyncio.Queue()
@@ -479,7 +505,9 @@ class TestListenConnection:
 
         fake_munsit.state.require_api_key = "right"
         stt_inst = STT(
-            mode="streaming", api_key="wrong", base_url=fake_munsit.url,
+            mode="streaming",
+            api_key="wrong",
+            base_url=fake_munsit.url,
             http_session=http_session,
         )
         stream = stt_inst.stream(conn_options=APIConnectOptions(max_retry=0))

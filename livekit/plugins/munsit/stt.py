@@ -15,7 +15,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import time
 import weakref
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -39,7 +38,6 @@ from livekit.agents import (
 from livekit.agents.utils import is_given
 
 from ._utils import AudioEnergyFilter, PeriodicCollector, build_wav_header
-from .log import logger
 from .models import MunsitModels
 
 DEFAULT_BASE_URL = "wss://api.munsit.com/api/v1/listen"
@@ -185,7 +183,7 @@ class _STTOptions:
     return_confidence: bool
     language: str | None
     extra_query_params: dict[str, str] | None
-    on_enrichment: object | None = None   # callable(dict) for Sentiment/Gender events
+    on_enrichment: object | None = None  # callable(dict) for Sentiment/Gender events
 
 
 class STT(stt.STT):
@@ -277,8 +275,9 @@ class STT(stt.STT):
             if endpointing_ms == DEFAULT_ENDPOINTING_MS:
                 endpointing_ms = max(100, min(5000, int(finalize_after_silence_ms)))
         if is_given(vad_silence_ms):
-            warnings.warn("vad_silence_ms is deprecated and ignored.", DeprecationWarning,
-                          stacklevel=2)
+            warnings.warn(
+                "vad_silence_ms is deprecated and ignored.", DeprecationWarning, stacklevel=2
+            )
         if energy_filter is not False:
             warnings.warn(
                 "energy_filter is deprecated: batch mode uses an internal energy VAD and "
