@@ -7,4 +7,4 @@ livekit-plugins-munsit>=0.3.0
 livekit-plugins-silero
 livekit-plugins-openai
 livekit-plugins-cartesia
-python-dotenv>=1.0.1
+python-dotenv>=1.2.4
